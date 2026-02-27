@@ -4,7 +4,7 @@ import { Document } from 'mongoose';
 @Schema({ collection: 'oci_cost_modeling', timestamps: true })
 export class OciCostModeling extends Document {
   // ── Upload-based lift-and-shift modeling fields (new) ──────────────────────
-  @Prop({ default: null, index: true })
+  @Prop({ default: null })
   uploadId: string | null;
 
   @Prop({ default: null })
