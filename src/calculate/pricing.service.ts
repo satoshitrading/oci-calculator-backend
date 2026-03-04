@@ -33,7 +33,12 @@ export class PricingService {
     const items = response.data?.items ?? [];
     if (!items.length) return null;
     const item = items[0] as Record<string, unknown>;
-    const priceContainer = (item.prices as Array<{ prices?: Array<{ model?: string; value?: number }>; currencyCode?: string }>)?.[0];
+    type PriceEntry = { prices?: Array<{ model?: string; value?: number }>; currencyCode?: string };
+    const localizations = item.currencyCodeLocalizations as Array<PriceEntry> | undefined;
+    const legacyPrices = item.prices as Array<PriceEntry> | undefined;
+    const priceContainer: PriceEntry | undefined = Array.isArray(localizations)
+      ? localizations.find((l) => (l.currencyCode ?? '').toUpperCase() === (currencyCode ?? 'USD').toUpperCase()) ?? localizations[0]
+      : legacyPrices?.[0];
     const innerPrices = priceContainer?.prices ?? [];
     const payg = innerPrices.find((p) => p.model === 'PAY_AS_YOU_GO') ?? innerPrices[0];
     if (!payg) return null;

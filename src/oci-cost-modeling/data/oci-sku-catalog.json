@@ -1,0 +1,17 @@
+[
+  { "partNumber": "B88298", "skuName": "VM.Standard.E4.Flex — OCPU per Hour", "serviceCategory": "Compute", "unit": "OCPU-hours", "fallbackUnitPrice": 0.025 },
+  { "partNumber": "B89878", "skuName": "VM.Standard.OPT3.Flex — OCPU per Hour", "serviceCategory": "Compute", "unit": "OCPU-hours", "fallbackUnitPrice": 0.025 },
+  { "partNumber": "B94073", "skuName": "VM.Standard.A1.Flex — OCPU per Hour", "serviceCategory": "Compute", "unit": "OCPU-hours", "fallbackUnitPrice": 0.025 },
+  { "partNumber": "B89879", "skuName": "Block Volume Storage Capacity — GB per Month", "serviceCategory": "Storage", "unit": "GB-month", "fallbackUnitPrice": 0.0255 },
+  { "partNumber": "B90046", "skuName": "Outbound Data Transfer — GB", "serviceCategory": "Network", "unit": "GB", "fallbackUnitPrice": 0.0085 },
+  { "partNumber": "B88439", "skuName": "DBCS SQL Server Standard — OCPU per Hour (incl. license)", "serviceCategory": "Database", "unit": "OCPU-hours", "fallbackUnitPrice": 0.37 },
+  { "partNumber": "B103399", "skuName": "PostgreSQL Database — OCPU per Hour", "serviceCategory": "Database", "unit": "OCPU-hours", "fallbackUnitPrice": 0.0544 },
+  { "partNumber": "B91962", "skuName": "Autonomous Data Warehouse — OCPU per Hour", "serviceCategory": "Database", "unit": "OCPU-hours", "fallbackUnitPrice": 0.26 },
+  { "partNumber": "B89037", "skuName": "NoSQL Database — On-Demand", "serviceCategory": "Database", "unit": "units", "fallbackUnitPrice": 0.0025 },
+  { "partNumber": "B103069", "skuName": "Cache with Redis — GB per Hour", "serviceCategory": "Database", "unit": "GB-hours", "fallbackUnitPrice": 0.013 },
+  { "partNumber": "B89021", "skuName": "MySQL HeatWave — OCPU per Hour", "serviceCategory": "Database", "unit": "OCPU-hours", "fallbackUnitPrice": 0.0544 },
+  { "partNumber": "B91399", "skuName": "PostgreSQL Database Service", "serviceCategory": "Database", "unit": "OCPU-hours", "fallbackUnitPrice": 0.0544 },
+  { "partNumber": "B91600", "skuName": "SQL Server Standard", "serviceCategory": "Database", "unit": "OCPU-hours", "fallbackUnitPrice": 0.37 },
+  { "partNumber": "B103447", "skuName": "OCI Generative AI — On-Demand Inference", "serviceCategory": "GenAI", "unit": "units", "fallbackUnitPrice": 0.006 },
+  { "partNumber": "B88298", "skuName": "VM.Standard.E4.Flex — OCPU per Hour (fallback)", "serviceCategory": "Other", "unit": "OCPU-hours", "fallbackUnitPrice": 0.025 }
+]

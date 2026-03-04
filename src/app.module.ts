@@ -10,6 +10,7 @@ import { ProposalsModule } from './proposals/proposals.module';
 import { QuotationsModule } from './quotations/quotations.module';
 import { BillingModule } from './billing/billing.module';
 import { OciCostModelingModule } from './oci-cost-modeling/oci-cost-modeling.module';
+import { OciSkuMappingsModule } from './oci-sku-mappings/oci-sku-mappings.module';
 import { DatabaseModule } from './database/database.module';
 import { DocumentsModule } from './documents/documents.module';
 
@@ -19,6 +20,9 @@ import { DocumentsModule } from './documents/documents.module';
     MongooseModule.forRootAsync({
       useFactory: () => ({
         uri: process.env.MONGODB_URI || process.env.DATABASE_URL || 'mongodb://localhost:27017/oci-price-calculator',
+        serverSelectionTimeoutMS: 10000,
+        socketTimeoutMS: 45000,
+        maxPoolSize: 10,
       }),
     }),
     DatabaseModule,
@@ -30,6 +34,7 @@ import { DocumentsModule } from './documents/documents.module';
     QuotationsModule,
     BillingModule,
     OciCostModelingModule,
+    OciSkuMappingsModule,
     DocumentsModule,
   ],
   controllers: [HealthController],

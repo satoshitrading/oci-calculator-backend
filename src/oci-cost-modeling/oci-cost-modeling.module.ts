@@ -8,11 +8,13 @@ import {
   UnifiedBilling,
   UnifiedBillingSchema,
 } from '../database/schemas/unified-billing.schema';
+import { PricingService } from '../calculate/pricing.service';
 import { PricingModule } from '../pricing/pricing.module';
+import { OciSkuMappingsModule } from '../oci-sku-mappings/oci-sku-mappings.module';
 import { OciCostModelingController } from './oci-cost-modeling.controller';
 import { OciCostModelingRepository } from './oci-cost-modeling.repository';
 import { OciCostModelingService } from './oci-cost-modeling.service';
-import { PricingService } from '../calculate/pricing.service';
+import { OciSkuCatalogService } from './oci-sku-catalog.service';
 
 @Module({
   imports: [
@@ -21,9 +23,10 @@ import { PricingService } from '../calculate/pricing.service';
       { name: UnifiedBilling.name, schema: UnifiedBillingSchema },
     ]),
     PricingModule,
+    OciSkuMappingsModule,
   ],
   controllers: [OciCostModelingController],
-  providers: [OciCostModelingRepository, OciCostModelingService, PricingService],
+  providers: [OciCostModelingRepository, OciSkuCatalogService, PricingService, OciCostModelingService],
   exports: [OciCostModelingService],
 })
 export class OciCostModelingModule {}

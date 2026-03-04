@@ -46,6 +46,10 @@ export class OciCostModeling extends Document {
   @Prop({ default: null, type: Number })
   savingsPct: number | null;
 
+  /** When set, OCI cost was not calculated (no matching OCI SKU for source service). */
+  @Prop({ default: null })
+  skipReason: string | null;
+
   // ── Legacy fields (backward compat with existing records) ──────────────────
   @Prop({ default: null })
   billingId: number | null;

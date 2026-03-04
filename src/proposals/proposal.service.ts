@@ -214,12 +214,15 @@ export class ProposalService {
         doc.moveDown(0.5);
         doc.fontSize(8);
         rows.slice(0, 100).forEach((row) => {
+          const skipped = row.skipReason != null && row.skipReason !== '' && row.ociEstimatedCost == null;
+          const ociCell = skipped ? 'Skipped' : (row.ociEstimatedCost != null ? fmt(row.ociEstimatedCost) : '—');
+          const saveCell = skipped ? '—' : `${(row.savingsPct ?? 0).toFixed(1)}%`;
           doc.text(
             `${row.sourceService.slice(0, 40).padEnd(40)}  ` +
             `[${row.serviceCategory.slice(0, 8).padEnd(8)}]  ` +
             `Source: ${fmt(row.sourceCost).padStart(10)} ${currencyCode}  ` +
-            `OCI (${row.ociSkuPartNumber}): ${fmt(row.ociEstimatedCost).padStart(10)} ${currencyCode}  ` +
-            `Save: ${row.savingsPct.toFixed(1)}%`,
+            `OCI (${(row.ociSkuPartNumber || '—').slice(0, 12)}): ${String(ociCell).padStart(10)} ${currencyCode}  ` +
+            `Save: ${saveCell}`,
           );
         });
         if (rows.length > 100) {
@@ -304,32 +307,35 @@ export class ProposalService {
       'Source Provider',
       'Source Cost',
       'Currency',
-      'OCI SKU',
-      'OCI SKU Name',
+      'Part Number',
+      'Product Name',
       'OCI Qty',
       'OCI Unit',
       'OCI Unit Price',
       'OCI Est. Cost',
       'Savings',
       'Savings %',
+      'Notes',
     ];
     itemsSheet.getRow(1).font = { bold: true };
 
     rows.forEach((row, idx) => {
+      const skipped = row.skipReason != null && row.skipReason !== '';
       itemsSheet.getRow(idx + 2).values = [
         row.sourceService,
         row.serviceCategory,
         row.sourceProvider,
         row.sourceCost,
         row.sourceCurrencyCode,
-        row.ociSkuPartNumber,
-        row.ociSkuName,
+        row.ociSkuPartNumber ?? '',
+        row.ociSkuName ?? '',
         row.ociEquivalentQuantity ?? '',
-        row.ociUnit,
-        row.ociUnitPrice,
-        row.ociEstimatedCost,
-        row.savingsAmount,
-        `${row.savingsPct.toFixed(1)}%`,
+        row.ociUnit ?? '',
+        row.ociUnitPrice ?? '',
+        row.ociEstimatedCost ?? (skipped ? 'Skipped' : ''),
+        row.savingsAmount ?? '',
+        skipped ? '—' : `${(row.savingsPct ?? 0).toFixed(1)}%`,
+        row.skipReason ?? '',
       ];
     });
     itemsSheet.getColumn(1).width = 40;

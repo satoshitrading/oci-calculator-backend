@@ -5,126 +5,10 @@ import { OciCostModeling } from '../database/schemas/oci-cost-modeling.schema';
 import { UnifiedBilling } from '../database/schemas/unified-billing.schema';
 import { PricingService } from '../calculate/pricing.service';
 import { OciServiceCategory } from '../documents/ingestion.types';
-
-// ---------------------------------------------------------------------------
-// OCI SKU defaults per service category
-// ---------------------------------------------------------------------------
-interface SkuDefault {
-  partNumber: string;
-  skuName: string;
-  unit: string;
-  fallbackUnitPrice: number; // USD
-}
-
-// ---------------------------------------------------------------------------
-// Fix 3: Fine-grained DATABASE sub-type mapping
-// Preserves service equivalence per requirements:
-//   "PostgreSQL remains PostgreSQL, SQL Server remains SQL Server"
-// ---------------------------------------------------------------------------
-const DATABASE_SUBTYPE_MAP: Array<{ pattern: RegExp; sku: SkuDefault }> = [
-  // SQL Server — $0.37/OCPU includes Windows + SQL Server Standard license
-  {
-    pattern: /sql.?server|sqlserver|mssql|sql express/i,
-    sku: {
-      partNumber: 'B88439',
-      skuName: 'DBCS SQL Server Standard — OCPU per Hour (incl. license)',
-      unit: 'OCPU-hours',
-      fallbackUnitPrice: 0.37, // per requirements line 661
-    },
-  },
-  // PostgreSQL (RDS PostgreSQL, Aurora PostgreSQL)
-  {
-    pattern: /postgres|aurora.?postgres|pg\b/i,
-    sku: {
-      partNumber: 'B103399',
-      skuName: 'PostgreSQL Database — OCPU per Hour',
-      unit: 'OCPU-hours',
-      fallbackUnitPrice: 0.0544,
-    },
-  },
-  // Autonomous Data Warehouse (Redshift, Athena, BigQuery, Synapse)
-  {
-    pattern: /redshift|athena|bigquery|synapse|data.?warehouse|dwh/i,
-    sku: {
-      partNumber: 'B91962',
-      skuName: 'Autonomous Data Warehouse — OCPU per Hour',
-      unit: 'OCPU-hours',
-      fallbackUnitPrice: 0.26,
-    },
-  },
-  // NoSQL (DynamoDB, DocumentDB, MongoDB, Neptune, Cosmos DB, Firestore)
-  {
-    pattern: /dynamo|documentdb|mongodb|neptune|cosmos|firestore|nosql/i,
-    sku: {
-      partNumber: 'B89037',
-      skuName: 'NoSQL Database — On-Demand',
-      unit: 'units',
-      fallbackUnitPrice: 0.0025,
-    },
-  },
-  // Cache (ElastiCache Redis/Memcached, Azure Cache, Cloud Memorystore)
-  {
-    pattern: /elasticache|redis|memcache|cache for redis/i,
-    sku: {
-      partNumber: 'B103069',
-      skuName: 'Cache with Redis — GB per Hour',
-      unit: 'GB-hours',
-      fallbackUnitPrice: 0.013,
-    },
-  },
-  // Aurora MySQL / standard MySQL / MariaDB (default database)
-  {
-    pattern: /mysql|aurora.?mysql|mariadb|aurora\b/i,
-    sku: {
-      partNumber: 'B89021',
-      skuName: 'MySQL HeatWave — OCPU per Hour',
-      unit: 'OCPU-hours',
-      fallbackUnitPrice: 0.0544,
-    },
-  },
-];
-
-// Default DATABASE SKU when no sub-type pattern matches
-const DATABASE_DEFAULT_SKU: SkuDefault = {
-  partNumber: 'B89021',
-  skuName: 'MySQL HeatWave — OCPU per Hour',
-  unit: 'OCPU-hours',
-  fallbackUnitPrice: 0.0544,
-};
-
-const CATEGORY_SKU_MAP: Record<OciServiceCategory | string, SkuDefault> = {
-  [OciServiceCategory.COMPUTE]: {
-    partNumber: 'B88298',
-    skuName: 'VM.Standard.E4.Flex — OCPU per Hour',
-    unit: 'OCPU-hours',
-    fallbackUnitPrice: 0.025,
-  },
-  [OciServiceCategory.STORAGE]: {
-    partNumber: 'B89879',
-    skuName: 'Block Volume Storage Capacity — GB per Month',
-    unit: 'GB-month',
-    fallbackUnitPrice: 0.0255,
-  },
-  [OciServiceCategory.NETWORK]: {
-    partNumber: 'B90046',
-    skuName: 'Outbound Data Transfer — GB',
-    unit: 'GB',
-    fallbackUnitPrice: 0.0085,
-  },
-  [OciServiceCategory.DATABASE]: DATABASE_DEFAULT_SKU,
-  [OciServiceCategory.GENAI]: {
-    partNumber: 'B103447',
-    skuName: 'OCI Generative AI — On-Demand Inference',
-    unit: 'units',
-    fallbackUnitPrice: 0.006,
-  },
-  [OciServiceCategory.OTHER]: {
-    partNumber: 'B88298',
-    skuName: 'VM.Standard.E4.Flex — OCPU per Hour (fallback)',
-    unit: 'OCPU-hours',
-    fallbackUnitPrice: 0.025,
-  },
-};
+import { OciSkuCatalogService } from './oci-sku-catalog.service';
+import { OciSkuMappingsRepository } from '../oci-sku-mappings/oci-sku-mappings.repository';
+import { similarityToCandidate, SIMILARITY_THRESHOLD } from '../common/similarity.util';
+import { withMongoRetry, BULK_INSERT_BATCH_SIZE } from '../common/mongo-bulk.util';
 
 // Fix 2: Windows Server license SKU — charged per OCPU per Hour
 // Per requirements: "4 OCPU × 744 hours × $0.092 per OCPU/hour"
@@ -165,7 +49,8 @@ export interface LiftAndShiftRow {
   ociEquivalentQuantity: number | null;
   ociUnit: string;
   ociUnitPrice: number;
-  ociEstimatedCost: number;
+  /** Null when skipped (no matching OCI SKU) */
+  ociEstimatedCost: number | null;
   savingsAmount: number;
   savingsPct: number;
   /** Fix 4: true when an AWS Spot instance was converted to OCI On-Demand */
@@ -174,6 +59,8 @@ export interface LiftAndShiftRow {
   hasWindowsLicense: boolean;
   /** Fix 2: additional Windows license cost added on top of base compute cost */
   windowsLicenseCost: number;
+  /** When set, OCI cost was not calculated (no matching OCI SKU for source service). */
+  skipReason?: string | null;
 }
 
 export interface LiftAndShiftResult {
@@ -187,6 +74,8 @@ export interface LiftAndShiftResult {
     totalSavings: number;
     totalSavingsPct: number;
     byCategory: Record<string, { sourceCost: number; ociCost: number; savings: number }>;
+    skippedCount?: number;
+    skippedSourceCost?: number;
   };
 }
 
@@ -200,6 +89,8 @@ export class OciCostModelingService {
     @InjectModel(UnifiedBilling.name)
     private readonly unifiedBillingModel: Model<UnifiedBilling>,
     private readonly pricingService: PricingService,
+    private readonly ociSkuCatalog: OciSkuCatalogService,
+    private readonly ociSkuMappings: OciSkuMappingsRepository,
   ) {}
 
   // ---------------------------------------------------------------------------
@@ -222,26 +113,65 @@ export class OciCostModelingService {
     }
 
     // Delete any prior modeling records for this upload (idempotent re-run)
-    await this.modelingModel.deleteMany({ uploadId });
+    await withMongoRetry(() => this.modelingModel.deleteMany({ uploadId }).exec());
 
     const providerDetected =
       billingRecords.find((r) => r.provider && r.provider !== 'unknown')?.provider ??
       billingRecords[0]?.provider ??
       'unknown';
 
-    // ── Step 1: Pre-resolve every SKU so we know ALL part numbers needed ──────
-    // This is done before the main loop so we can batch-fetch live prices for
-    // every unique part number in a single concurrent round-trip.
-    const resolvedSkus: SkuDefault[] = billingRecords.map((record) => {
+    // ── Step 1: Obtain category from each record; filter OCI SKU list by category; pick best by similarity ─
+    const standardCategories = [
+      OciServiceCategory.COMPUTE,
+      OciServiceCategory.STORAGE,
+      OciServiceCategory.NETWORK,
+      OciServiceCategory.DATABASE,
+      OciServiceCategory.OTHER,
+    ];
+    const categoriesFromBilling = billingRecords.map((r) => String(r.serviceCategory ?? OciServiceCategory.OTHER));
+    const categories = [...new Set([...standardCategories, ...categoriesFromBilling])];
+    const candidatesByCategory: Record<string, Awaited<ReturnType<OciSkuMappingsRepository['listByCategory']>>> = {};
+    for (const cat of categories) {
+      candidatesByCategory[cat] = await this.ociSkuMappings.listByCategory(cat);
+    }
+    console.log(candidatesByCategory, '===candidatesByCategory')
+    type MappingRow = { record: (typeof billingRecords)[0]; mapping: Awaited<ReturnType<OciSkuMappingsRepository['listByCategory']>>[number] | null };
+    const resolved: MappingRow[] = billingRecords.map((record) => {
       const category = (record.serviceCategory as OciServiceCategory) ?? OciServiceCategory.OTHER;
-      return category === OciServiceCategory.DATABASE
-        ? this.resolveDbSku(record.productName ?? '', record.productCode ?? '')
-        : (CATEGORY_SKU_MAP[category] ?? CATEGORY_SKU_MAP[OciServiceCategory.OTHER]);
+      const sourceService =
+        record.productName || record.productCode || String(category);
+      const candidates = candidatesByCategory[String(category)] ?? [];
+      if (candidates.length === 0) {
+        return { record, mapping: null };
+      }
+      let best = candidates[0]!;
+      let bestScore = similarityToCandidate(
+        sourceService,
+        best.skuName ?? best.productTitle,
+        '',
+      );
+      for (let i = 1; i < candidates.length; i++) {
+        const m = candidates[i]!;
+        const score = similarityToCandidate(
+          sourceService,
+          m.skuName ?? m.productTitle,
+          '',
+        );
+        if (score > bestScore) {
+          bestScore = score;
+          best = m;
+        }
+      }
+      if (bestScore < SIMILARITY_THRESHOLD) {
+        return { record, mapping: null };
+      }
+      return { record, mapping: best };
     });
 
-    // Collect unique part numbers: all resolved SKUs + Windows license SKU
-    const partNumbersNeeded = new Set<string>(resolvedSkus.map((s) => s.partNumber));
-    // Always pre-fetch Windows license so it's ready for any Windows Compute row
+    // Collect unique part numbers only from matched rows + Windows license SKU
+    const partNumbersNeeded = new Set<string>(
+      resolved.filter((r) => r.mapping).map((r) => r.mapping!.partNumber),
+    );
     partNumbersNeeded.add(WINDOWS_LICENSE_SKU);
 
     // ── Step 2: Fetch ALL prices keyed by part number (concurrent) ────────────
@@ -261,16 +191,64 @@ export class OciCostModelingService {
     let windowsCount = 0;
 
     for (let i = 0; i < billingRecords.length; i++) {
-      const record = billingRecords[i]!;
+      const { record, mapping } = resolved[i]!;
       const category = (record.serviceCategory as OciServiceCategory) ?? OciServiceCategory.OTHER;
       const productName = record.productName ?? '';
       const productCode = record.productCode ?? '';
+      const sourceService = productName || productCode || String(category);
 
-      // ── Step 3: Use pre-resolved SKU for this record ──────────────────────
-      const skuDefault = resolvedSkus[i]!;
+      // ── No matching OCI SKU: skip cost calculation, add row with skipReason ─
+      if (!mapping) {
+        const skipReason = `No matching part number for source service: ${sourceService}`;
+        const sourceCost = record.costAfterTax ?? record.costBeforeTax ?? 0;
+        const row: LiftAndShiftRow = {
+          sourceService,
+          serviceCategory: category,
+          sourceProvider: record.provider ?? providerDetected,
+          sourceCost,
+          sourceCurrencyCode: record.currencyCode ?? currencyCode,
+          ociSkuPartNumber: '',
+          ociSkuName: '',
+          ociEquivalentQuantity: record.ociEquivalentQuantity ?? null,
+          ociUnit: '',
+          ociUnitPrice: 0,
+          ociEstimatedCost: null,
+          savingsAmount: 0,
+          savingsPct: 0,
+          isSpotConverted: false,
+          hasWindowsLicense: false,
+          windowsLicenseCost: 0,
+          skipReason,
+        };
+        rows.push(row);
+        insertDocs.push({
+          uploadId,
+          sourceProvider: row.sourceProvider,
+          sourceService: row.sourceService,
+          serviceCategory: category,
+          sourceCost,
+          sourceCurrencyCode: row.sourceCurrencyCode,
+          ociSkuPartNumber: null,
+          ociSkuName: null,
+          ociEquivalentQuantity: row.ociEquivalentQuantity,
+          ociUnit: null,
+          ociUnitPrice: null,
+          ociEstimatedCost: null,
+          savingsAmount: null,
+          savingsPct: null,
+          skipReason,
+        });
+        continue;
+      }
 
-      // Price keyed by partNumber — always the correct SKU price (live or fallback)
-      const ociUnitPrice = ociPrices[skuDefault.partNumber] ?? skuDefault.fallbackUnitPrice;
+      // ── Step 3: Use resolved mapping for this record ────────────────────────
+      const skuPartNumber = mapping.partNumber;
+      const skuName = mapping.skuName ?? mapping.partNumber;
+      const skuUnit = mapping.unit ?? 'OCPU-hours';
+      const skuFallbackPrice = mapping.fallbackUnitPrice ?? 0;
+
+      // Price keyed by partNumber — live or fallback
+      const ociUnitPrice = ociPrices[skuPartNumber] ?? skuFallbackPrice;
 
       const sourceCost = record.costAfterTax ?? record.costBeforeTax ?? 0;
       const ociEquivalentQuantity = record.ociEquivalentQuantity ?? null;
@@ -351,11 +329,10 @@ export class OciCostModelingService {
           windowsLicenseCost = +(ociEquivalentQuantity * windowsLivePricePerOcpuHour).toFixed(4);
         } else if (sourceCost > 0) {
           // Estimate: Windows overhead ratio vs base compute price
-          const baseOciCost = ociEstimatedCost;
-          const computeBasePrice = ociPrices[CATEGORY_SKU_MAP[OciServiceCategory.COMPUTE].partNumber]
-            ?? CATEGORY_SKU_MAP[OciServiceCategory.COMPUTE].fallbackUnitPrice;
+          const computeFallback = this.ociSkuCatalog.getFallbackForCategory(OciServiceCategory.COMPUTE);
+          const computeBasePrice = ociPrices[computeFallback.partNumber] ?? computeFallback.fallbackUnitPrice;
           const windowsRatio = windowsLivePricePerOcpuHour / computeBasePrice;
-          windowsLicenseCost = +(baseOciCost * windowsRatio).toFixed(4);
+          windowsLicenseCost = +(ociEstimatedCost * windowsRatio).toFixed(4);
         }
         ociEstimatedCost = +(ociEstimatedCost + windowsLicenseCost).toFixed(4);
         windowsCount++;
@@ -374,10 +351,10 @@ export class OciCostModelingService {
         sourceProvider: record.provider ?? providerDetected,
         sourceCost,
         sourceCurrencyCode: record.currencyCode ?? currencyCode,
-        ociSkuPartNumber: skuDefault.partNumber,
-        ociSkuName: skuDefault.skuName,
+        ociSkuPartNumber: skuPartNumber,
+        ociSkuName: skuName,
         ociEquivalentQuantity,
-        ociUnit: skuDefault.unit,
+        ociUnit: skuUnit,
         ociUnitPrice,
         ociEstimatedCost,
         savingsAmount,
@@ -395,10 +372,10 @@ export class OciCostModelingService {
         serviceCategory: category,
         sourceCost,
         sourceCurrencyCode: row.sourceCurrencyCode,
-        ociSkuPartNumber: skuDefault.partNumber,
-        ociSkuName: skuDefault.skuName,
+        ociSkuPartNumber: skuPartNumber,
+        ociSkuName: skuName,
         ociEquivalentQuantity,
-        ociUnit: skuDefault.unit,
+        ociUnit: skuUnit,
         ociUnitPrice,
         ociEstimatedCost,
         savingsAmount,
@@ -407,7 +384,12 @@ export class OciCostModelingService {
     }
 
     if (insertDocs.length > 0) {
-      await this.modelingModel.insertMany(insertDocs);
+      for (let i = 0; i < insertDocs.length; i += BULK_INSERT_BATCH_SIZE) {
+        const batch = insertDocs.slice(i, i + BULK_INSERT_BATCH_SIZE);
+        await withMongoRetry(() =>
+          this.modelingModel.insertMany(batch, { ordered: false }),
+        );
+      }
     }
 
     if (spotCount > 0) {
@@ -442,30 +424,35 @@ export class OciCostModelingService {
     currencyCode: string = 'USD',
   ): Promise<LiftAndShiftResult | null> {
     const docs = await this.modelingModel
-      .find({ uploadId, ociEstimatedCost: { $ne: null } })
+      .find({ uploadId })
       .lean()
       .exec();
 
     if (!docs.length) return null;
 
-    const rows: LiftAndShiftRow[] = docs.map((d) => ({
-      sourceService: d.sourceService ?? d.resourceId ?? 'Unknown',
-      serviceCategory: d.serviceCategory ?? OciServiceCategory.OTHER,
-      sourceProvider: d.sourceProvider ?? d.sourceCloud ?? 'unknown',
-      sourceCost: d.sourceCost ?? 0,
-      sourceCurrencyCode: d.sourceCurrencyCode ?? currencyCode,
-      ociSkuPartNumber: d.ociSkuPartNumber ?? d.ociTargetSku ?? '',
-      ociSkuName: d.ociSkuName ?? '',
-      ociEquivalentQuantity: d.ociEquivalentQuantity ?? null,
-      ociUnit: d.ociUnit ?? '',
-      ociUnitPrice: d.ociUnitPrice ?? 0,
-      ociEstimatedCost: d.ociEstimatedCost ?? 0,
-      savingsAmount: d.savingsAmount ?? 0,
-      savingsPct: d.savingsPct ?? 0,
-      isSpotConverted: false,   // not persisted in schema; re-modelling required for this flag
-      hasWindowsLicense: false, // not persisted in schema; re-modelling required for this flag
-      windowsLicenseCost: 0,
-    }));
+    const rows: LiftAndShiftRow[] = docs.map((d) => {
+      const skipReason = d.skipReason ?? null;
+      const ociEstimatedCost = d.ociEstimatedCost ?? (skipReason ? null : 0);
+      return {
+        sourceService: d.sourceService ?? d.resourceId ?? 'Unknown',
+        serviceCategory: d.serviceCategory ?? OciServiceCategory.OTHER,
+        sourceProvider: d.sourceProvider ?? d.sourceCloud ?? 'unknown',
+        sourceCost: d.sourceCost ?? 0,
+        sourceCurrencyCode: d.sourceCurrencyCode ?? currencyCode,
+        ociSkuPartNumber: d.ociSkuPartNumber ?? d.ociTargetSku ?? '',
+        ociSkuName: d.ociSkuName ?? '',
+        ociEquivalentQuantity: d.ociEquivalentQuantity ?? null,
+        ociUnit: d.ociUnit ?? '',
+        ociUnitPrice: d.ociUnitPrice ?? 0,
+        ociEstimatedCost,
+        savingsAmount: d.savingsAmount ?? 0,
+        savingsPct: d.savingsPct ?? 0,
+        isSpotConverted: false,   // not persisted in schema; re-modelling required for this flag
+        hasWindowsLicense: false, // not persisted in schema; re-modelling required for this flag
+        windowsLicenseCost: 0,
+        skipReason: skipReason || undefined,
+      };
+    });
 
     const provider =
       rows.find((r) => r.sourceProvider !== 'unknown')?.sourceProvider ?? 'unknown';
@@ -473,28 +460,15 @@ export class OciCostModelingService {
   }
 
   // ---------------------------------------------------------------------------
-  // Fix 3: Resolve DATABASE sub-type SKU from product name / code
-  // ---------------------------------------------------------------------------
-
-  private resolveDbSku(productName: string, productCode: string): SkuDefault {
-    const combined = `${productName} ${productCode}`;
-    for (const { pattern, sku } of DATABASE_SUBTYPE_MAP) {
-      if (pattern.test(combined)) return sku;
-    }
-    return DATABASE_DEFAULT_SKU;
-  }
-
-  // ---------------------------------------------------------------------------
   // Private helpers
   // ---------------------------------------------------------------------------
 
   /**
-   * Fetch live OCI prices for every unique part number concurrently.
+   * Fetch OCI prices for every unique part number concurrently.
    *
    * Strategy per part number (in priority order):
-   *   1. Local MongoDB cache  (`getPriceFromDb`)
-   *   2. Live OCI Pricing API (`fetchOciPriceByPartNumber`)
-   *   3. Hardcoded fallback from `SkuDefault.fallbackUnitPrice`
+   *   1. Live OCI Pricing API (`fetchOciPriceByPartNumber`)
+   *   2. Fallback from OCI SKU catalog fallbackUnitPrice
    *
    * Returns a map keyed by partNumber → unit price (USD or requested currency).
    */
@@ -502,12 +476,8 @@ export class OciCostModelingService {
     partNumbers: string[],
     currencyCode: string,
   ): Promise<Record<string, number>> {
-    // Build a lookup of fallback prices from every known SKU definition
     const fallbackByPartNumber: Record<string, number> = {};
-    for (const sku of Object.values(CATEGORY_SKU_MAP)) {
-      fallbackByPartNumber[sku.partNumber] = sku.fallbackUnitPrice;
-    }
-    for (const { sku } of DATABASE_SUBTYPE_MAP) {
+    for (const sku of this.ociSkuCatalog.getAll()) {
       fallbackByPartNumber[sku.partNumber] = sku.fallbackUnitPrice;
     }
     fallbackByPartNumber[WINDOWS_LICENSE_SKU] = WINDOWS_LICENSE_PRICE_PER_OCPU_HOUR;
@@ -515,23 +485,16 @@ export class OciCostModelingService {
     // Fetch all part numbers concurrently
     const results = await Promise.allSettled(
       partNumbers.map(async (partNumber) => {
-        // 1. Try local DB cache first (fast, no network)
-        const fromDb = await this.pricingService.getPriceFromDb(partNumber, currencyCode);
-        if (fromDb && fromDb.unitPrice > 0) {
-          this.logger.debug(`[pricing] ${partNumber} → $${fromDb.unitPrice} (DB cache)`);
-          return { partNumber, price: fromDb.unitPrice };
-        }
-
-        // 2. Try live OCI Pricing API
+        // 1. Try live OCI Pricing API
         const live = await this.pricingService.fetchOciPriceByPartNumber(partNumber, currencyCode);
         if (live && live.unitPrice > 0) {
           this.logger.debug(`[pricing] ${partNumber} → $${live.unitPrice} (live API)`);
           return { partNumber, price: live.unitPrice };
         }
 
-        // 3. Fall back to hardcoded constant
+        // 2. Fall back to catalog/constant
         const fallback = fallbackByPartNumber[partNumber] ?? 0;
-        this.logger.warn(`[pricing] ${partNumber} not found in DB or live API — using fallback $${fallback}`);
+        this.logger.warn(`[pricing] ${partNumber} not found in live API — using fallback $${fallback}`);
         return { partNumber, price: fallback };
       }),
     );
@@ -561,19 +524,25 @@ export class OciCostModelingService {
   ): LiftAndShiftResult {
     let totalSourceCost = 0;
     let totalOciEstimatedCost = 0;
+    let skippedCount = 0;
+    let skippedSourceCost = 0;
     const byCategory: Record<string, { sourceCost: number; ociCost: number; savings: number }> = {};
 
     for (const row of rows) {
       totalSourceCost += row.sourceCost;
-      totalOciEstimatedCost += row.ociEstimatedCost;
-
-      const cat = row.serviceCategory;
-      if (!byCategory[cat]) {
-        byCategory[cat] = { sourceCost: 0, ociCost: 0, savings: 0 };
+      if (row.skipReason != null && row.skipReason !== '' && row.ociEstimatedCost == null) {
+        skippedCount++;
+        skippedSourceCost += row.sourceCost;
+      } else {
+        totalOciEstimatedCost += row.ociEstimatedCost ?? 0;
+        const cat = row.serviceCategory;
+        if (!byCategory[cat]) {
+          byCategory[cat] = { sourceCost: 0, ociCost: 0, savings: 0 };
+        }
+        byCategory[cat].sourceCost += row.sourceCost;
+        byCategory[cat].ociCost += row.ociEstimatedCost ?? 0;
+        byCategory[cat].savings += row.savingsAmount;
       }
-      byCategory[cat].sourceCost += row.sourceCost;
-      byCategory[cat].ociCost += row.ociEstimatedCost;
-      byCategory[cat].savings += row.savingsAmount;
     }
 
     for (const cat of Object.keys(byCategory)) {
@@ -582,9 +551,10 @@ export class OciCostModelingService {
       byCategory[cat].savings = +byCategory[cat].savings.toFixed(4);
     }
 
-    const totalSavings = +(totalSourceCost - totalOciEstimatedCost).toFixed(4);
+    const totalSavings = +(totalSourceCost - totalOciEstimatedCost - skippedSourceCost).toFixed(4);
+    const sourceCostForPct = totalSourceCost - skippedSourceCost;
     const totalSavingsPct =
-      totalSourceCost > 0 ? +((totalSavings / totalSourceCost) * 100).toFixed(2) : 0;
+      sourceCostForPct > 0 ? +((totalSavings / sourceCostForPct) * 100).toFixed(2) : 0;
 
     return {
       uploadId,
@@ -597,6 +567,8 @@ export class OciCostModelingService {
         totalSavings,
         totalSavingsPct,
         byCategory,
+        skippedCount,
+        skippedSourceCost: +skippedSourceCost.toFixed(4),
       },
     };
   }
@@ -613,6 +585,8 @@ export class OciCostModelingService {
         totalSavings: 0,
         totalSavingsPct: 0,
         byCategory: {},
+        skippedCount: 0,
+        skippedSourceCost: 0,
       },
     };
   }
