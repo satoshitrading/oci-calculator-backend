@@ -10,7 +10,7 @@ import { OciCostModeling } from '../database/schemas/oci-cost-modeling.schema';
 import { CloudProviderDetected, DocumentUploadResult, NormalizedLineItem } from './documents.types';
 import { IngestionStatus } from './ingestion.types';
 import { CostSummaryService } from './cost-summary.service';
-import { ParserFactory, PdfExtractor } from './parser-factory.service';
+import { ParserFactory, ParseOptions, PdfExtractor } from './parser-factory.service';
 import { NormalizationService } from './normalization.service';
 import { UploadDocumentDto } from './dto/upload-document.dto';
 import { CollectorService, RemoteBillingFile } from './collector.service';
@@ -80,7 +80,7 @@ export class DocumentIngestionService {
       throw new BadRequestException('File exceeds the 50 MB limit');
     }
 
-    // 1. Create upload record with PENDING status
+    // 1. Create upload record with processing status and progress 0
     const uploadDoc = await this.uploadModel.create({
       originalName: file.originalname ?? 'unknown',
       mimeType: file.mimetype ?? 'application/octet-stream',
@@ -92,29 +92,66 @@ export class DocumentIngestionService {
       uploadedAt: new Date(),
       status: 'processing' as DocumentUploadStatus,
       errorMessage: null,
+      progressPercent: 0,
+      totalPages: null,
+      processedPages: null,
     });
 
     const uploadId = String(uploadDoc._id);
     this.logger.log(`[${uploadId}] Ingestion started for "${file.originalname}"`);
 
-    // 2. Optionally persist the raw file to disk
+    // 2. Persist the raw file to disk (for background pipeline)
     const storagePath = await this.persistFile(buffer, uploadId, file.originalname ?? '');
     if (storagePath) {
       await this.uploadModel.updateOne({ _id: uploadDoc._id }, { storagePath });
     }
 
+    // 3. Run pipeline in background; return immediately so client can poll for progress
+    const originalName = file.originalname ?? 'unknown';
+    const mimeType = file.mimetype ?? 'application/octet-stream';
+    void this.runPipeline(uploadId, buffer, originalName, mimeType, dto, extractor).catch((err) => {
+      this.logger.error(`[${uploadId}] Background pipeline error: ${err instanceof Error ? err.message : String(err)}`);
+    });
+
+    return {
+      uploadId,
+      fileName: originalName,
+      status: 'processing',
+      progressPercent: 0,
+      totalPages: null,
+      processedPages: null,
+    };
+  }
+
+  /**
+   * Background pipeline: parse with progress callback, then normalize and persist.
+   * Updates DocumentUpload progressPercent/processedPages/totalPages during parse, then status completed/failed.
+   */
+  private async runPipeline(
+    uploadId: string,
+    buffer: Buffer,
+    originalName: string,
+    mimeType: string,
+    dto: UploadDocumentDto,
+    extractor: PdfExtractor,
+  ): Promise<void> {
+    const onProgress: ParseOptions['onProgress'] = (processed, total) =>
+      this.updateProgress(uploadId, processed, total);
+
     try {
-      // 3. Detect file type and extract raw line items via ParserFactory
       const { lineItems: rawItems, providerDetected, fileType, totalTax, invoiceBillingPeriod } =
-        await this.parserFactory.parse(file, dto.providerHint, extractor);
+        await this.parserFactory.parseFromBuffer(
+          buffer,
+          originalName,
+          mimeType,
+          dto.providerHint,
+          extractor,
+          { onProgress },
+        );
 
-      // 4. Apply OCI normalization (category mapping, OCPU calc, Windows SKU flagging)
       const normalizedItems = this.normalizationService.normalizeAll(rawItems, providerDetected);
-
-      // 5. Build cost summary (totalTax is added to grandTotal)
       const costSummary = this.costSummaryService.build(normalizedItems, totalTax ?? null);
 
-      // 6. Persist to UnifiedBilling (primary Phase 1 store)
       if (normalizedItems.length > 0) {
         await this.unifiedBillingModel.insertMany(
           normalizedItems.map((item) => ({
@@ -128,7 +165,6 @@ export class DocumentIngestionService {
             ociEquivalentQuantity: item.ociEquivalentQuantity ?? null,
             serviceCategory: item.serviceCategory,
             unitPrice: item.unitPrice ?? null,
-            // FinOps rules
             isPaidSku: item.isPaidSku ?? true,
             brlTaxAmount: item.brlTaxAmount ?? null,
             costAfterTax: item.costAfterTax ?? item.costBeforeTax ?? null,
@@ -144,8 +180,6 @@ export class DocumentIngestionService {
             rawData: item.rawLine ?? null,
           })),
         );
-
-        // 7. Persist to DocumentLineItem (backward compatibility with existing APIs)
         await this.lineItemModel.insertMany(
           normalizedItems.map((item) => ({
             uploadId,
@@ -172,54 +206,40 @@ export class DocumentIngestionService {
         );
       }
 
-      // 8. Mark upload as completed
       await this.uploadModel.updateOne(
-        { _id: uploadDoc._id },
+        { _id: uploadId },
         {
           status: 'completed' as DocumentUploadStatus,
           providerDetected,
-          // Line-item-derived dates (CSV/XLSX); null for PDF invoices
+          progressPercent: 100,
+          processedPages: null,
+          totalPages: null,
           billingPeriodStart: costSummary.billingPeriodStart,
           billingPeriodEnd: costSummary.billingPeriodEnd,
-          // Invoice-header dates (populated for PDFs via Gemini/Textract)
           invoiceBillingPeriodStart: invoiceBillingPeriod?.start ?? null,
           invoiceBillingPeriodEnd: invoiceBillingPeriod?.end ?? null,
-          // Total tax from the invoice summary row
           totalTax: totalTax ?? null,
           errorMessage: null,
         },
       );
 
-      this.logger.log(
-        `[${uploadId}] Completed: ${normalizedItems.length} items, provider=${providerDetected}`,
-      );
-
-      // Prefer the invoice-header billing period; fall back to the range
-      // derived from line-item dates by CostSummaryService.
-      const billingPeriod = (invoiceBillingPeriod?.start ?? invoiceBillingPeriod?.end)
-        ? invoiceBillingPeriod!
-        : { start: costSummary.billingPeriodStart, end: costSummary.billingPeriodEnd };
-
-      return {
-        uploadId,
-        fileName: file.originalname ?? 'unknown',
-        fileType,
-        cloudProviderDetected: providerDetected as CloudProviderDetected,
-        billingPeriod,
-        totalTax: totalTax ?? null,
-        lineItems: normalizedItems as unknown as NormalizedLineItem[],
-        costSummary,
-      };
+      this.logger.log(`[${uploadId}] Completed: ${normalizedItems.length} items, provider=${providerDetected}`);
     } catch (err) {
       const message = this.sanitizeErrorMessage(err);
       await this.uploadModel.updateOne(
-        { _id: uploadDoc._id },
+        { _id: uploadId },
         { status: 'failed' as DocumentUploadStatus, errorMessage: message },
       );
       this.logger.error(`[${uploadId}] Ingestion failed: ${message}`);
-      if (err instanceof BadRequestException) throw err;
-      throw new BadRequestException(message);
     }
+  }
+
+  private async updateProgress(uploadId: string, processedPages: number, totalPages: number): Promise<void> {
+    const progressPercent = totalPages > 0 ? Math.round((processedPages / totalPages) * 100) : 0;
+    await this.uploadModel.updateOne(
+      { _id: uploadId },
+      { progressPercent, processedPages, totalPages },
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -385,6 +405,9 @@ export class DocumentIngestionService {
       fileName: string;
       providerDetected: string;
       status: string;
+      progressPercent: number | null;
+      totalPages: number | null;
+      processedPages: number | null;
       billingPeriodStart: Date | null;
       billingPeriodEnd: Date | null;
       uploadedAt: Date;
@@ -424,13 +447,18 @@ export class DocumentIngestionService {
           invoiceBillingPeriodStart?: Date | null;
           invoiceBillingPeriodEnd?: Date | null;
           totalTax?: number | null;
+          progressPercent?: number | null;
+          totalPages?: number | null;
+          processedPages?: number | null;
         };
         return {
           uploadId: String(u._id),
           fileName: u.originalName,
           providerDetected: u.providerDetected,
           status: u.status,
-          // Prefer invoice-header dates (PDF); fall back to line-item-derived dates (CSV/XLSX)
+          progressPercent: doc.progressPercent ?? null,
+          totalPages: doc.totalPages ?? null,
+          processedPages: doc.processedPages ?? null,
           billingPeriodStart: doc.invoiceBillingPeriodStart ?? u.billingPeriodStart ?? null,
           billingPeriodEnd: doc.invoiceBillingPeriodEnd ?? u.billingPeriodEnd ?? null,
           uploadedAt: u.uploadedAt,
@@ -447,6 +475,33 @@ export class DocumentIngestionService {
   async getByUploadId(uploadId: string): Promise<DocumentUploadResult | null> {
     const upload = await this.uploadModel.findById(uploadId).lean().exec();
     if (!upload) return null;
+
+    const uploadDoc = upload as typeof upload & {
+      invoiceBillingPeriodStart?: Date | null;
+      invoiceBillingPeriodEnd?: Date | null;
+      totalTax?: number | null;
+      progressPercent?: number | null;
+      totalPages?: number | null;
+      processedPages?: number | null;
+    };
+
+    const base = {
+      uploadId: String(upload._id),
+      fileName: upload.originalName,
+      status: upload.status,
+      progressPercent: uploadDoc.progressPercent ?? null,
+      totalPages: uploadDoc.totalPages ?? null,
+      processedPages: uploadDoc.processedPages ?? null,
+      errorMessage: upload.errorMessage ?? null,
+    };
+
+    if (upload.status === 'processing') {
+      return { ...base };
+    }
+
+    if (upload.status === 'failed') {
+      return { ...base, lineItems: [], costSummary: undefined };
+    }
 
     const lineItems = await this.lineItemModel.find({ uploadId }).lean().exec();
     const normalized = lineItems.map((d) => ({
@@ -470,18 +525,10 @@ export class DocumentIngestionService {
       rawLine: d.rawLine ?? null,
     }));
 
-    const uploadDoc = upload as typeof upload & {
-      invoiceBillingPeriodStart?: Date | null;
-      invoiceBillingPeriodEnd?: Date | null;
-      totalTax?: number | null;
-    };
-
-    // Pass the stored totalTax so grandTotal = subtotal + tax (not just subtotal)
     const costSummary = this.costSummaryService.build(normalized, uploadDoc.totalTax ?? null);
 
     return {
-      uploadId: String(upload._id),
-      fileName: upload.originalName,
+      ...base,
       fileType: upload.mimeType.includes('pdf')
         ? 'pdf'
         : upload.mimeType.includes('spreadsheet') || upload.originalName?.toLowerCase().endsWith('.xlsx')
@@ -489,7 +536,6 @@ export class DocumentIngestionService {
           : 'csv',
       cloudProviderDetected: upload.providerDetected as CloudProviderDetected,
       billingPeriod: {
-        // Prefer invoice-header dates (PDF); fall back to line-item-derived dates (CSV/XLSX)
         start: uploadDoc.invoiceBillingPeriodStart ?? upload.billingPeriodStart ?? null,
         end: uploadDoc.invoiceBillingPeriodEnd ?? upload.billingPeriodEnd ?? null,
       },

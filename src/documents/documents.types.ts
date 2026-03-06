@@ -46,13 +46,20 @@ export interface CostSummary {
 export interface DocumentUploadResult {
   uploadId: string;
   fileName: string;
-  fileType: string;
-  cloudProviderDetected: CloudProviderDetected;
-  billingPeriod: { start: Date | null; end: Date | null };
+  /** Present when upload is async (processing or completed or failed). */
+  status?: 'processing' | 'completed' | 'failed';
+  /** 0–100 during processing. */
+  progressPercent?: number | null;
+  totalPages?: number | null;
+  processedPages?: number | null;
+  errorMessage?: string | null;
+  fileType?: string;
+  cloudProviderDetected?: CloudProviderDetected;
+  billingPeriod?: { start: Date | null; end: Date | null };
   /** Total tax from the invoice summary level (e.g. "Total tax USD 230.23"). */
-  totalTax: number | null;
-  lineItems: NormalizedLineItem[];
-  costSummary: CostSummary;
+  totalTax?: number | null;
+  lineItems?: NormalizedLineItem[];
+  costSummary?: CostSummary;
   /** Set when only some pages/sheets were processed. */
   partialExtraction?: boolean;
   /** Message describing partial extraction or data issues. */

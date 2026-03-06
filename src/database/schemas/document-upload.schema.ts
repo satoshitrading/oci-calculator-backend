@@ -36,6 +36,18 @@ export class DocumentUpload extends Document {
   @Prop({ default: null })
   errorMessage: string | null;
 
+  /** Progress 0–100 during processing (PDF page-range ingestion). */
+  @Prop({ default: null, type: Number })
+  progressPercent: number | null;
+
+  /** Total PDF pages (when processing by page ranges). */
+  @Prop({ default: null, type: Number })
+  totalPages: number | null;
+
+  /** Number of page chunks completed (when processing by page ranges). */
+  @Prop({ default: null, type: Number })
+  processedPages: number | null;
+
   /**
    * Total tax amount extracted from the invoice header (e.g. "Total tax: 230.23").
    * Populated for PDF invoices processed by Gemini or Textract.

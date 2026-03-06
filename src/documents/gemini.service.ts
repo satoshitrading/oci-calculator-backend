@@ -8,7 +8,11 @@ import { NormalizedLineItem } from './documents.types';
 //   GEMINI_API_KEY  – Google AI Studio API key (aistudio.google.com/app/apikey)
 //
 // Optional:
-//   GEMINI_MODEL    – model name (default: gemini-2.5-flash)
+//   GEMINI_MODEL        – model name (default: gemini-2.5-flash)
+//   GEMINI_MAX_RETRIES  – retries on ECONNRESET/network errors (default: 3)
+//   GEMINI_RETRY_DELAY_MS – base delay in ms for exponential backoff (default: 2000)
+//   GEMINI_TIMEOUT_MS       – request timeout in ms, 60s–300s (default: 120000)
+//   GEMINI_PDF_PAGES_PER_CHUNK – max pages per Gemini request, 1–2 (default: 2); PDFs with more pages are split.
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
@@ -92,12 +96,24 @@ This is a single document-level number, e.g. "USD 230.23" → 230.23.
 Place it in the ROOT taxAmount field, NOT in any line item's taxAmount.
 
 ════════════════════════════════════════════════════════
+GRAND TOTAL & LINE AMOUNTS
+════════════════════════════════════════════════════════
+- Grand total (total) = document's SUBTOTAL + document's TOTAL TAX (root taxAmount).
+  Do NOT compute Grand total from line-item quantity × unit price.
+- For each line item, use the AMOUNT column (line total / charge) as the line item's amount.
+  For AWS-style tables that have no "Usage Quantity" column, amount is the authoritative
+  charge per line; leave quantity omitted or null — do not infer quantity from amount/unit price
+  for totalling. Any quantity-like values that are tax-related belong in tax fields
+  (root taxAmount or line item taxAmount), not in quantity used for Grand total.
+
+════════════════════════════════════════════════════════
 LINE ITEMS  (lineItems array)
 ════════════════════════════════════════════════════════
 Extract EVERY individual charge row from every service table.
 Do NOT include summary rows (subtotal, total, taxes) as line items.
 Each line item must have at minimum a description and an amount.
 Line item taxAmount should only be filled if the row itself shows a per-item tax.
+For AWS-style tables, amount is the authoritative charge per line; quantity is optional.
 
 ════════════════════════════════════════════════════════
 AMOUNTS & CURRENCY
@@ -113,6 +129,11 @@ GENERAL RULES
 - Return ONLY valid JSON matching the schema. No markdown, no prose.
 - Omit a field entirely if its value is not present in the document (do not output null).
 `.trim();
+
+/** Prompt suffix when sending a partial PDF (page range) so the model knows context. */
+function extractionPromptForPageRange(startPage: number, endPage: number, totalPages: number): string {
+  return `${EXTRACTION_PROMPT}\n\nThis PDF shows only pages ${startPage}–${endPage} of ${totalPages}. Extract all line items and any header/summary fields visible on these pages.`;
+}
 
 // ---------------------------------------------------------------------------
 // Typed Gemini response — matches INVOICE_SCHEMA
@@ -160,9 +181,55 @@ export class GeminiService {
   // process() — send PDF buffer to Gemini and return NormalizedLineItem[]
   // ---------------------------------------------------------------------------
 
+  /** Transient network errors that are worth retrying (ECONNRESET, timeouts, etc.). */
+  private isRetryableNetworkError(err: unknown): boolean {
+    const e = err as { message?: string; cause?: unknown };
+    const msg = (e?.message ?? '').toLowerCase();
+    if (msg.includes('fetch failed') || msg.includes('econnreset') || msg.includes('etimedout')) return true;
+    const cause = e?.cause as { code?: string } | undefined;
+    return cause?.code === 'ECONNRESET' || cause?.code === 'ETIMEDOUT' || cause?.code === 'ECONNREFUSED';
+  }
+
+  private async delayMs(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  /** Get PDF page count via pdf-lib. Returns 0 on failure so caller can fall back to single-doc. */
+  private async getPdfPageCount(buffer: Buffer): Promise<number> {
+    try {
+      const { PDFDocument } = await import('pdf-lib');
+      const doc = await PDFDocument.load(buffer, { ignoreEncryption: true });
+      return doc.getPageCount();
+    } catch {
+      return 0;
+    }
+  }
+
+  /** Extract a 1-based page range [startPage, endPage] into a new PDF buffer. */
+  private async extractPdfPageRange(
+    buffer: Buffer,
+    startPage1Based: number,
+    endPage1Based: number,
+  ): Promise<Buffer> {
+    const { PDFDocument } = await import('pdf-lib');
+    const source = await PDFDocument.load(buffer, { ignoreEncryption: true });
+    const dest = await PDFDocument.create();
+    const indices = Array.from(
+      { length: endPage1Based - startPage1Based + 1 },
+      (_, i) => startPage1Based - 1 + i,
+    );
+    const copied = await dest.copyPages(source, indices);
+    for (const page of copied) {
+      dest.addPage(page);
+    }
+    const bytes = await dest.save();
+    return Buffer.from(bytes);
+  }
+
   async process(
     buffer: Buffer,
     fileName: string,
+    options?: { onProgress?: (processedPages: number, totalPages: number) => void },
   ): Promise<{
     lineItems: NormalizedLineItem[];
     providerDetected: string;
@@ -171,41 +238,152 @@ export class GeminiService {
   }> {
     this.logger.log(`Gemini AI extraction started for "${fileName}"`);
 
+    const pagesPerChunk = Math.min(2, Math.max(1, parseInt(process.env.GEMINI_PDF_PAGES_PER_CHUNK ?? '2', 10)));
+    const totalPages = await this.getPdfPageCount(buffer);
+    const useChunks = totalPages > pagesPerChunk;
+
+    if (useChunks && totalPages > 0) {
+      this.logger.log(`Splitting "${fileName}" into page ranges (${totalPages} pages, ${pagesPerChunk} per request)`);
+      return this.processByPageRanges(buffer, fileName, totalPages, pagesPerChunk, options?.onProgress);
+    }
+
+    const result = await this.processSingleBuffer(buffer, fileName, EXTRACTION_PROMPT);
+    options?.onProgress?.(1, 1);
+    return result;
+  }
+
+  /**
+   * Process a PDF in chunks of 1–2 pages, then merge results.
+   * Invoice-level fields (billing period, total tax, provider) taken from the first chunk.
+   */
+  private async processByPageRanges(
+    buffer: Buffer,
+    fileName: string,
+    totalPages: number,
+    pagesPerChunk: number,
+    onProgress?: (processedPages: number, totalPages: number) => void,
+  ): Promise<{
+    lineItems: NormalizedLineItem[];
+    providerDetected: string;
+    totalTax: number | null;
+    invoiceBillingPeriod: { start: Date | null; end: Date | null };
+  }> {
+    const ranges: [number, number][] = [];
+    for (let start = 1; start <= totalPages; start += pagesPerChunk) {
+      const end = Math.min(start + pagesPerChunk - 1, totalPages);
+      ranges.push([start, end]);
+    }
+
+    const totalChunks = ranges.length;
+    const chunkResults: {
+      lineItems: NormalizedLineItem[];
+      providerDetected: string;
+      totalTax: number | null;
+      invoiceBillingPeriod: { start: Date | null; end: Date | null };
+    }[] = [];
+
+    for (let i = 0; i < ranges.length; i++) {
+      const [start, end] = ranges[i]!;
+      const chunkBuffer = await this.extractPdfPageRange(buffer, start, end);
+      const prompt = extractionPromptForPageRange(start, end, totalPages);
+      const label = `pages ${start}-${end}/${totalPages}`;
+      this.logger.log(`Processing "${fileName}" (${label})`);
+      const result = await this.processSingleBuffer(chunkBuffer, fileName, prompt);
+      chunkResults.push(result);
+      onProgress?.(i + 1, totalChunks);
+    }
+
+    const allLineItems = chunkResults.flatMap((r) => r.lineItems);
+    const first = chunkResults[0]!;
+    const providerDetected = first.providerDetected || chunkResults.find((r) => r.providerDetected)?.providerDetected || 'unknown';
+    const totalTax = first.totalTax ?? chunkResults.find((r) => r.totalTax != null)?.totalTax ?? null;
+    const invoiceBillingPeriod =
+      (first.invoiceBillingPeriod.start != null || first.invoiceBillingPeriod.end != null)
+        ? first.invoiceBillingPeriod
+        : chunkResults.find(
+            (r) => r.invoiceBillingPeriod.start != null || r.invoiceBillingPeriod.end != null,
+          )?.invoiceBillingPeriod ?? first.invoiceBillingPeriod;
+
+    this.logger.log(
+      `Merged ${chunkResults.length} chunks for "${fileName}": ${allLineItems.length} line items (provider=${providerDetected})`,
+    );
+    return {
+      lineItems: allLineItems,
+      providerDetected,
+      totalTax,
+      invoiceBillingPeriod,
+    };
+  }
+
+  /**
+   * Single Gemini request with retries. Used for full PDF or one page-range chunk.
+   */
+  private async processSingleBuffer(
+    buffer: Buffer,
+    fileName: string,
+    promptText: string,
+  ): Promise<{
+    lineItems: NormalizedLineItem[];
+    providerDetected: string;
+    totalTax: number | null;
+    invoiceBillingPeriod: { start: Date | null; end: Date | null };
+  }> {
     const ai = await this.getClient();
     const modelName = process.env.GEMINI_MODEL ?? 'gemini-2.5-flash';
+    const maxRetries = Math.max(1, parseInt(process.env.GEMINI_MAX_RETRIES ?? '3', 10));
+    const baseDelayMs = Math.max(500, parseInt(process.env.GEMINI_RETRY_DELAY_MS ?? '2000', 10));
 
-    let response: { text?: string };
-    try {
-      response = await ai.models.generateContent({
-        model: modelName,
-        contents: [
-          {
-            inlineData: {
-              data: buffer.toString('base64'),
-              mimeType: 'application/pdf',
-            },
-          },
-          { text: EXTRACTION_PROMPT },
-        ],
-        config: {
-          responseMimeType: 'application/json',
-          responseSchema: INVOICE_SCHEMA,
-          toolConfig: {
-            functionCallingConfig: {
-              mode: 'NONE',
-            },
-          },
-        },
-      });
-    } catch (err: unknown) {
-      const e = err as { name?: string; message?: string; status?: number; cause?: unknown };
-      const cause = e.cause as { code?: string } | undefined;
-      this.logger.error(
-        `Gemini API error for "${fileName}": [${e.status ?? 'unknown'}] ${e.name} – ${e.message}` +
-        (cause?.code ? ` (cause: ${cause.code})` : ''),
-      );
-      throw err;
+    const payload = {
+      model: modelName,
+      contents: [
+        { inlineData: { data: buffer.toString('base64'), mimeType: 'application/pdf' } },
+        { text: promptText },
+      ],
+      config: {
+        responseMimeType: 'application/json',
+        responseSchema: INVOICE_SCHEMA,
+        toolConfig: { functionCallingConfig: { mode: 'NONE' } },
+      },
+    };
+
+    let lastErr: unknown;
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        const response = await ai.models.generateContent(payload);
+        return this.parseAndMapResponse(response, fileName);
+      } catch (err: unknown) {
+        lastErr = err;
+        const e = err as { name?: string; message?: string; status?: number; cause?: unknown };
+        const cause = e.cause as { code?: string } | undefined;
+        this.logger.warn(
+          `Gemini API attempt ${attempt}/${maxRetries} failed for "${fileName}": [${e.status ?? 'unknown'}] ${e.name} – ${e.message}` +
+          (cause?.code ? ` (cause: ${cause.code})` : ''),
+        );
+        if (attempt < maxRetries && this.isRetryableNetworkError(err)) {
+          const delay = baseDelayMs * Math.pow(2, attempt - 1);
+          this.logger.log(`Retrying in ${delay}ms...`);
+          await this.delayMs(delay);
+        } else {
+          this.logger.error(
+            `Gemini API error for "${fileName}": [${e.status ?? 'unknown'}] ${e.name} – ${e.message}` +
+            (cause?.code ? ` (cause: ${cause.code})` : ''),
+          );
+          throw err;
+        }
+      }
     }
+    throw lastErr;
+  }
+
+  private parseAndMapResponse(
+    response: { text?: string },
+    fileName: string,
+  ): {
+    lineItems: NormalizedLineItem[];
+    providerDetected: string;
+    totalTax: number | null;
+    invoiceBillingPeriod: { start: Date | null; end: Date | null };
+  } {
 
     const raw = (response.text ?? '').trim();
     if (!raw) {
@@ -233,7 +411,8 @@ export class GeminiService {
       this.clientPromise = import('@google/genai').then(({ GoogleGenAI }) => {
         const apiKey = process.env.GEMINI_API_KEY ?? process.env.GOOGLE_API_KEY;
         if (!apiKey) throw new Error('GEMINI_API_KEY is not set');
-        return new GoogleGenAI({ apiKey, httpOptions: { timeout: 120_000 } } as any);
+        const timeoutMs = Math.min(300_000, Math.max(60_000, parseInt(process.env.GEMINI_TIMEOUT_MS ?? '120000', 10)));
+        return new GoogleGenAI({ apiKey, httpOptions: { timeout: timeoutMs } } as any);
       });
     }
     return this.clientPromise;

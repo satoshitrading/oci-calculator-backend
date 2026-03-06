@@ -20,6 +20,10 @@ export interface ParserResult {
   invoiceBillingPeriod?: { start: Date | null; end: Date | null };
 }
 
+export interface ParseOptions {
+  onProgress?: (processedPages: number, totalPages: number) => void;
+}
+
 const PDF_MAGIC = Buffer.from('%PDF');
 const XLSX_ZIP_MAGIC = Buffer.from('PK');
 const XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
@@ -56,9 +60,17 @@ export class ParserFactory {
     file: Express.Multer.File,
     providerHint?: string,
     extractor: PdfExtractor = 'auto',
+    options?: ParseOptions,
   ): Promise<ParserResult> {
     const buffer = this.toBuffer(file);
-    return this.parseFromBuffer(buffer, file.originalname ?? '', file.mimetype ?? '', providerHint, extractor);
+    return this.parseFromBuffer(
+      buffer,
+      file.originalname ?? '',
+      file.mimetype ?? '',
+      providerHint,
+      extractor,
+      options,
+    );
   }
 
   /**
@@ -70,6 +82,7 @@ export class ParserFactory {
    * @param mimeType     MIME type hint (may be empty; magic bytes take precedence)
    * @param providerHint Optional cloud provider override
    * @param extractor    Force a specific PDF extractor ('textract' | 'gemini' | 'auto')
+   * @param options      Optional progress callback for PDF page-range processing
    */
   async parseFromBuffer(
     buffer: Buffer,
@@ -77,17 +90,24 @@ export class ParserFactory {
     mimeType: string,
     providerHint?: string,
     extractor: PdfExtractor = 'auto',
+    options?: ParseOptions,
   ): Promise<ParserResult> {
     const fileType = this.detectFileType(buffer, fileName, mimeType);
     this.logger.debug(`Routing buffer "${fileName}" → parser: ${fileType}`);
 
     switch (fileType) {
-      case 'csv':
-        return this.parseCsv(buffer, fileName, providerHint);
-      case 'xlsx':
-        return this.parseXlsx(buffer, fileName, providerHint);
+      case 'csv': {
+        const csvResult = this.parseCsv(buffer, fileName, providerHint);
+        options?.onProgress?.(1, 1);
+        return csvResult;
+      }
+      case 'xlsx': {
+        const xlsxResult = await this.parseXlsx(buffer, fileName, providerHint);
+        options?.onProgress?.(1, 1);
+        return xlsxResult;
+      }
       case 'pdf':
-        return this.parsePdf(buffer, fileName, providerHint, extractor);
+        return this.parsePdf(buffer, fileName, providerHint, extractor, options);
     }
   }
 
@@ -149,7 +169,10 @@ export class ParserFactory {
     fileName: string,
     providerHint?: string,
     extractor: PdfExtractor = 'auto',
+    options?: ParseOptions,
   ): Promise<ParserResult> {
+    const onProgress = options?.onProgress;
+
     // --- Explicit extractor: textract ---
     if (extractor === 'textract') {
       if (!this.textract.isAvailable()) {
@@ -160,6 +183,7 @@ export class ParserFactory {
       }
       this.logger.log('Using Amazon Textract for PDF processing (explicit)');
       const { lineItems, providerDetected } = await this.textract.process(buffer, fileName);
+      onProgress?.(1, 1);
       return { lineItems, providerDetected: providerHint ?? providerDetected, fileType: 'pdf' };
     }
 
@@ -172,7 +196,7 @@ export class ParserFactory {
       }
       this.logger.log('Using Gemini AI for PDF processing (explicit)');
       const { lineItems, providerDetected, totalTax, invoiceBillingPeriod } =
-        await this.gemini.process(buffer, fileName);
+        await this.gemini.process(buffer, fileName, { onProgress });
       return {
         lineItems,
         providerDetected: providerHint ?? providerDetected,
@@ -186,7 +210,7 @@ export class ParserFactory {
     if (this.gemini.isAvailable()) {
       this.logger.log('Using Gemini AI for PDF processing');
       const { lineItems, providerDetected, totalTax, invoiceBillingPeriod } =
-        await this.gemini.process(buffer, fileName);
+        await this.gemini.process(buffer, fileName, { onProgress });
       return {
         lineItems,
         providerDetected: providerHint ?? providerDetected,
@@ -199,12 +223,14 @@ export class ParserFactory {
     if (this.textract.isAvailable()) {
       this.logger.log('Using Amazon Textract for PDF processing');
       const { lineItems, providerDetected } = await this.textract.process(buffer, fileName);
+      onProgress?.(1, 1);
       return { lineItems, providerDetected: providerHint ?? providerDetected, fileType: 'pdf' };
     }
 
     this.logger.debug('No AI extractor configured (GEMINI_API_KEY / Textract creds); falling back to pdf-parse + OCR');
     const { text, providerDetected } = await this.pdfExtractor.extract(buffer, fileName);
     const lineItems = this.pdfExtractor.normalizeTextToLineItems(text, fileName);
+    onProgress?.(1, 1);
     return {
       lineItems,
       providerDetected: providerHint ?? providerDetected,
