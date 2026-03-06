@@ -33,6 +33,18 @@ export interface DryRunResult {
 const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50 MB
 
 /**
+ * Returns true if the line item has none of Quantity, Unit, or Region — i.e. it is tax-related.
+ * Such items are excluded from MongoDB, Grand total, and the Extracted Data table.
+ * If an item has at least one of (quantity, unitOfMeasure, regionName), it is a real line item.
+ */
+function isTaxOnlyLineItem(item: NormalizedLineItem): boolean {
+  const hasQuantity = item.usageQuantity != null && (typeof item.usageQuantity !== 'number' || !Number.isNaN(item.usageQuantity));
+  const hasUnit = item.unitOfMeasure != null && String(item.unitOfMeasure).trim() !== '';
+  const hasRegion = item.regionName != null && String(item.regionName).trim() !== '';
+  return !hasQuantity && !hasUnit && !hasRegion;
+}
+
+/**
  * DocumentIngestionService is the single orchestrator for the ingestion pipeline.
  * The controller calls only this service; all other services are internal details.
  *
@@ -149,7 +161,10 @@ export class DocumentIngestionService {
           { onProgress },
         );
 
-      const normalizedItems = this.normalizationService.normalizeAll(rawItems, providerDetected);
+      // Exclude tax-only rows (no Quantity, Unit, or Region): do not insert to DB or include in Grand total
+      const lineItemsForIngestion = rawItems.filter((item) => !isTaxOnlyLineItem(item));
+
+      const normalizedItems = this.normalizationService.normalizeAll(lineItemsForIngestion, providerDetected);
       const costSummary = this.costSummaryService.build(normalizedItems, totalTax ?? null);
 
       if (normalizedItems.length > 0) {
@@ -279,8 +294,11 @@ export class DocumentIngestionService {
         dto.providerHint,
       );
 
+    // Exclude tax-only rows (no Quantity, Unit, or Region): do not insert to DB or include in Grand total
+    const lineItemsForIngestion = rawItems.filter((item) => !isTaxOnlyLineItem(item));
+
     // Apply mandatory OCI FinOps normalization rules
-    const normalizedItems = this.normalizationService.normalizeAll(rawItems, providerDetected);
+    const normalizedItems = this.normalizationService.normalizeAll(lineItemsForIngestion, providerDetected);
     const costSummary = this.costSummaryService.build(normalizedItems);
 
     // Persist via the same upload→line-item pipeline as manual uploads
