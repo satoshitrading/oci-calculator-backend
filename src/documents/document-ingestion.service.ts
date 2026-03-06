@@ -112,13 +112,7 @@ export class DocumentIngestionService {
     const uploadId = String(uploadDoc._id);
     this.logger.log(`[${uploadId}] Ingestion started for "${file.originalname}"`);
 
-    // 2. Persist the raw file to disk (for background pipeline)
-    const storagePath = await this.persistFile(buffer, uploadId, file.originalname ?? '');
-    if (storagePath) {
-      await this.uploadModel.updateOne({ _id: uploadDoc._id }, { storagePath });
-    }
-
-    // 3. Run pipeline in background; return immediately so client can poll for progress
+    // 2. Run pipeline in background (includes optional file persist); return immediately to avoid 504 timeout
     const originalName = file.originalname ?? 'unknown';
     const mimeType = file.mimetype ?? 'application/octet-stream';
     void this.runPipeline(uploadId, buffer, originalName, mimeType, dto, extractor).catch((err) => {
@@ -151,6 +145,12 @@ export class DocumentIngestionService {
       this.updateProgress(uploadId, processed, total);
 
     try {
+      // Optional: persist file to disk in background (not in request path to avoid 504)
+      const storagePath = await this.persistFile(buffer, uploadId, originalName);
+      if (storagePath) {
+        await this.uploadModel.updateOne({ _id: uploadId }, { storagePath });
+      }
+
       const { lineItems: rawItems, providerDetected, fileType, totalTax, invoiceBillingPeriod } =
         await this.parserFactory.parseFromBuffer(
           buffer,

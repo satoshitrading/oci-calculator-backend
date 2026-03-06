@@ -96,17 +96,6 @@ This is a single document-level number, e.g. "USD 230.23" → 230.23.
 Place it in the ROOT taxAmount field, NOT in any line item's taxAmount.
 
 ════════════════════════════════════════════════════════
-GRAND TOTAL & LINE AMOUNTS
-════════════════════════════════════════════════════════
-- Grand total (total) = document's SUBTOTAL + document's TOTAL TAX (root taxAmount).
-  Do NOT compute Grand total from line-item quantity × unit price.
-- For each line item, use the AMOUNT column (line total / charge) as the line item's amount.
-  For AWS-style tables that have no "Usage Quantity" column, amount is the authoritative
-  charge per line; leave quantity omitted or null — do not infer quantity from amount/unit price
-  for totalling. Any quantity-like values that are tax-related belong in tax fields
-  (root taxAmount or line item taxAmount), not in quantity used for Grand total.
-
-════════════════════════════════════════════════════════
 LINE ITEMS  (lineItems array)
 ════════════════════════════════════════════════════════
 Extract EVERY individual charge row from every service table.
