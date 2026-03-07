@@ -262,14 +262,15 @@ export class DocumentIngestionService {
   // ---------------------------------------------------------------------------
 
   /**
-   * Orchestrates the automated pull pipeline:
-   *   CollectorService (list / fetch) → ParserFactory → NormalizationService → MongoDB
+   * Orchestrates the automated pull pipeline. Dry-run returns immediately with file list.
+   * Full run returns immediately with uploadId and status 'processing'; actual fetch/parse
+   * runs in the background to avoid 504 on Railway. Poll GET /api/documents/:uploadId for result.
    *
    * @param dto  CollectBillingDto with optional backend, providerHint, prefix, dryRun
    */
   async processFromCollector(
     dto: CollectBillingDto,
-  ): Promise<CollectionResult | DryRunResult> {
+  ): Promise<CollectionResult | DryRunResult | DocumentUploadResult> {
     // Dry-run: list available files without downloading
     if (dto.dryRun) {
       const files = await this.collectorService.listBillingFiles(dto);
@@ -277,47 +278,83 @@ export class DocumentIngestionService {
       return { source: backend, files };
     }
 
-    // Full run: fetch latest billing file from cloud storage
-    const fetched = await this.collectorService.fetchLatestBillingFile(dto);
-
-    this.logger.log(
-      `[Collector] Processing "${fetched.fileName}" from ${fetched.backend} ` +
-        `(${(fetched.sizeBytes / 1024).toFixed(1)} KB)`,
-    );
-
-    // Pipe buffer directly into ParserFactory
-    const { lineItems: rawItems, providerDetected, fileType } =
-      await this.parserFactory.parseFromBuffer(
-        fetched.buffer,
-        fetched.fileName,
-        fetched.mimeType,
-        dto.providerHint,
-      );
-
-    // Exclude tax-only rows (no Quantity, Unit, or Region): do not insert to DB or include in Grand total
-    const lineItemsForIngestion = rawItems.filter((item) => !isTaxOnlyLineItem(item));
-
-    // Apply mandatory OCI FinOps normalization rules
-    const normalizedItems = this.normalizationService.normalizeAll(lineItemsForIngestion, providerDetected);
-    const costSummary = this.costSummaryService.build(normalizedItems);
-
-    // Persist via the same upload→line-item pipeline as manual uploads
+    // Full run: create upload record and return immediately; run fetch/parse in background
     const uploadDoc = await this.uploadModel.create({
-      originalName: fetched.fileName,
-      mimeType: fetched.mimeType,
-      size: fetched.sizeBytes,
-      storagePath: `${fetched.backend}://${fetched.bucket}/${fetched.key}`,
-      providerDetected,
-      billingPeriodStart: costSummary.billingPeriodStart,
-      billingPeriodEnd: costSummary.billingPeriodEnd,
+      originalName: 'collecting...',
+      mimeType: 'application/octet-stream',
+      size: 0,
+      storagePath: null,
+      providerDetected: (dto.providerHint as CloudProviderDetected) ?? 'unknown',
+      billingPeriodStart: null,
+      billingPeriodEnd: null,
       uploadedAt: new Date(),
       status: 'processing' as DocumentUploadStatus,
       errorMessage: null,
     });
-
     const uploadId = String(uploadDoc._id);
+    this.logger.log(`[${uploadId}] Collect started; running in background`);
+
+    void this.runCollectPipeline(uploadId, dto).catch((err) => {
+      this.logger.error(
+        `[${uploadId}] Collect pipeline error: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    });
+
+    return {
+      uploadId,
+      fileName: 'collecting...',
+      status: 'processing',
+      progressPercent: 0,
+      totalPages: null,
+      processedPages: null,
+    };
+  }
+
+  /**
+   * Background: fetch billing file from storage, parse, normalize, persist. Updates upload status.
+   */
+  private async runCollectPipeline(
+    uploadId: string,
+    dto: CollectBillingDto,
+  ): Promise<void> {
+    const uploadDoc = await this.uploadModel.findById(uploadId).exec();
+    if (!uploadDoc) {
+      this.logger.warn(`[${uploadId}] Upload not found, skipping collect pipeline`);
+      return;
+    }
 
     try {
+      const fetched = await this.collectorService.fetchLatestBillingFile(dto);
+      this.logger.log(
+        `[${uploadId}] Processing "${fetched.fileName}" from ${fetched.backend} ` +
+          `(${(fetched.sizeBytes / 1024).toFixed(1)} KB)`,
+      );
+
+      await this.uploadModel.updateOne(
+        { _id: uploadId },
+        {
+          originalName: fetched.fileName,
+          mimeType: fetched.mimeType,
+          size: fetched.sizeBytes,
+          storagePath: `${fetched.backend}://${fetched.bucket}/${fetched.key}`,
+        },
+      );
+
+      const { lineItems: rawItems, providerDetected } =
+        await this.parserFactory.parseFromBuffer(
+          fetched.buffer,
+          fetched.fileName,
+          fetched.mimeType,
+          dto.providerHint,
+        );
+
+      const lineItemsForIngestion = rawItems.filter((item) => !isTaxOnlyLineItem(item));
+      const normalizedItems = this.normalizationService.normalizeAll(
+        lineItemsForIngestion,
+        providerDetected,
+      );
+      const costSummary = this.costSummaryService.build(normalizedItems);
+
       if (normalizedItems.length > 0) {
         await this.unifiedBillingModel.insertMany(
           normalizedItems.map((item) => ({
@@ -374,40 +411,25 @@ export class DocumentIngestionService {
       }
 
       await this.uploadModel.updateOne(
-        { _id: uploadDoc._id },
-        { status: 'completed' as DocumentUploadStatus, errorMessage: null },
+        { _id: uploadId },
+        {
+          status: 'completed' as DocumentUploadStatus,
+          errorMessage: null,
+          billingPeriodStart: costSummary.billingPeriodStart,
+          billingPeriodEnd: costSummary.billingPeriodEnd,
+        },
+      );
+      this.logger.log(
+        `[${uploadId}] Collect completed: ${normalizedItems.length} items, provider=${providerDetected}`,
       );
     } catch (err) {
       const message = this.sanitizeErrorMessage(err);
       await this.uploadModel.updateOne(
-        { _id: uploadDoc._id },
+        { _id: uploadId },
         { status: 'failed' as DocumentUploadStatus, errorMessage: message },
       );
-      throw err;
+      this.logger.error(`[${uploadId}] Collect failed: ${message}`);
     }
-
-    const uploadResult: DocumentUploadResult = {
-      uploadId,
-      fileName: fetched.fileName,
-      fileType,
-      cloudProviderDetected: providerDetected as CloudProviderDetected,
-      billingPeriod: {
-        start: costSummary.billingPeriodStart,
-        end: costSummary.billingPeriodEnd,
-      },
-      totalTax: null,
-      lineItems: normalizedItems as unknown as NormalizedLineItem[],
-      costSummary,
-    };
-
-    return {
-      source: fetched.backend,
-      bucket: fetched.bucket,
-      objectKey: fetched.key,
-      lastModified: fetched.lastModified,
-      sizeBytes: fetched.sizeBytes,
-      uploadResult,
-    };
   }
 
   // ---------------------------------------------------------------------------

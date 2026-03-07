@@ -170,11 +170,12 @@ export class GeminiService {
   // process() — send PDF buffer to Gemini and return NormalizedLineItem[]
   // ---------------------------------------------------------------------------
 
-  /** Transient network errors that are worth retrying (ECONNRESET, timeouts, etc.). */
+  /** Transient network errors that are worth retrying (ECONNRESET, timeouts, AbortError, etc.). */
   private isRetryableNetworkError(err: unknown): boolean {
-    const e = err as { message?: string; cause?: unknown };
+    const e = err as { name?: string; message?: string; cause?: unknown };
     const msg = (e?.message ?? '').toLowerCase();
-    if (msg.includes('fetch failed') || msg.includes('econnreset') || msg.includes('etimedout')) return true;
+    if (msg.includes('fetch failed') || msg.includes('econnreset') || msg.includes('etimedout') || msg.includes('aborted')) return true;
+    if (e?.name === 'AbortError') return true;
     const cause = e?.cause as { code?: string } | undefined;
     return cause?.code === 'ECONNRESET' || cause?.code === 'ETIMEDOUT' || cause?.code === 'ECONNREFUSED';
   }
