@@ -15,6 +15,7 @@ import { NormalizationService } from './normalization.service';
 import { UploadDocumentDto } from './dto/upload-document.dto';
 import { CollectorService, RemoteBillingFile } from './collector.service';
 import { CollectBillingDto } from './dto/collect-billing.dto';
+import { OciSkuResolutionService } from './oci-sku-resolution.service';
 
 export interface CollectionResult {
   source: string;
@@ -71,6 +72,7 @@ export class DocumentIngestionService {
     private readonly normalizationService: NormalizationService,
     private readonly costSummaryService: CostSummaryService,
     private readonly collectorService: CollectorService,
+    private readonly ociSkuResolutionService: OciSkuResolutionService,
   ) {}
 
   // ---------------------------------------------------------------------------
@@ -544,26 +546,74 @@ export class DocumentIngestionService {
     }
 
     const lineItems = await this.lineItemModel.find({ uploadId }).lean().exec();
-    const normalized = lineItems.map((d) => ({
-      invoiceId: d.invoiceId ?? null,
-      linkedAccountId: d.linkedAccountId ?? null,
-      resourceId: d.resourceId ?? null,
-      productId: d.productId ?? null,
-      productCode: d.productCode ?? null,
-      productName: d.productName ?? null,
-      serviceCategory: d.serviceCategory ?? null,
-      usageStartDate: d.usageStartDate ?? null,
-      usageEndDate: d.usageEndDate ?? null,
-      usageQuantity: d.usageQuantity ?? null,
-      unitOfMeasure: d.unitOfMeasure ?? null,
-      costBeforeTax: d.costBeforeTax ?? null,
-      taxAmount: d.taxAmount ?? null,
-      currencyCode: d.currencyCode ?? 'USD',
-      regionId: d.regionId ?? null,
-      regionName: d.regionName ?? null,
-      isSpotInstance: d.isSpotInstance ?? false,
-      rawLine: d.rawLine ?? null,
-    }));
+    const needsResolution = lineItems.filter(
+      (d) => d.ociSkuPartNumber == null || String(d.ociSkuPartNumber).trim() === '',
+    );
+    let resolved: Awaited<ReturnType<OciSkuResolutionService['resolveMany']>> = [];
+    if (needsResolution.length > 0) {
+      resolved = await this.ociSkuResolutionService.resolveMany(
+        needsResolution.map((d) => ({
+          productName: d.productName,
+          productCode: d.productCode,
+          serviceCategory: d.serviceCategory,
+        })),
+      );
+    }
+
+    const resolutionByIndex = new Map<number, { ociSkuPartNumber: string; ociSkuName: string } | null>();
+    let needIdx = 0;
+    for (let i = 0; i < lineItems.length; i++) {
+      const d = lineItems[i]!;
+      if (d.ociSkuPartNumber != null && String(d.ociSkuPartNumber).trim() !== '') continue;
+      const r = resolved[needIdx++] ?? null;
+      if (r) resolutionByIndex.set(i, r);
+    }
+
+    const normalized: NormalizedLineItem[] = lineItems.map((d, idx) => {
+      const resolvedSku = resolutionByIndex.get(idx);
+      const ociSkuPartNumber = d.ociSkuPartNumber != null && String(d.ociSkuPartNumber).trim() !== ''
+        ? d.ociSkuPartNumber
+        : (resolvedSku?.ociSkuPartNumber ?? null);
+      const ociSkuName = d.ociSkuName != null && String(d.ociSkuName).trim() !== ''
+        ? d.ociSkuName
+        : (resolvedSku?.ociSkuName ?? null);
+
+      return {
+        id: String((d as { _id: unknown })._id),
+        invoiceId: d.invoiceId ?? null,
+        linkedAccountId: d.linkedAccountId ?? null,
+        resourceId: d.resourceId ?? null,
+        productId: d.productId ?? null,
+        productCode: d.productCode ?? null,
+        productName: d.productName ?? null,
+        serviceCategory: d.serviceCategory ?? null,
+        usageStartDate: d.usageStartDate ?? null,
+        usageEndDate: d.usageEndDate ?? null,
+        usageQuantity: d.usageQuantity ?? null,
+        unitOfMeasure: d.unitOfMeasure ?? null,
+        costBeforeTax: d.costBeforeTax ?? null,
+        taxAmount: d.taxAmount ?? null,
+        currencyCode: d.currencyCode ?? 'USD',
+        regionId: d.regionId ?? null,
+        regionName: d.regionName ?? null,
+        isSpotInstance: d.isSpotInstance ?? false,
+        ociSkuPartNumber: ociSkuPartNumber ?? undefined,
+        ociSkuName: ociSkuName ?? undefined,
+        rawLine: d.rawLine ?? null,
+      };
+    });
+
+    if (resolutionByIndex.size > 0) {
+      const bulkUpdates = Array.from(resolutionByIndex.entries()).map(([idx]) => {
+        const doc = lineItems[idx]!;
+        const r = resolutionByIndex.get(idx)!;
+        return this.lineItemModel.updateOne(
+          { _id: (doc as { _id: unknown })._id, uploadId },
+          { $set: { ociSkuPartNumber: r.ociSkuPartNumber, ociSkuName: r.ociSkuName } },
+        );
+      });
+      await Promise.all(bulkUpdates);
+    }
 
     const costSummary = this.costSummaryService.build(normalized, uploadDoc.totalTax ?? null);
 
@@ -588,6 +638,89 @@ export class DocumentIngestionService {
   // ---------------------------------------------------------------------------
   // Delete upload (cascade)
   // ---------------------------------------------------------------------------
+
+  /**
+   * Update a single line item's OCI SKU (for user edits in Extracted Data table).
+   * Returns the updated line item fields (id, ociSkuPartNumber, ociSkuName) or null if not found.
+   */
+  async updateLineItemOciSku(
+    uploadId: string,
+    lineItemId: string,
+    payload: { ociSkuPartNumber?: string | null; ociSkuName?: string | null },
+  ): Promise<NormalizedLineItem | null> {
+    const update: Record<string, unknown> = {};
+    if (payload.ociSkuPartNumber !== undefined) update.ociSkuPartNumber = payload.ociSkuPartNumber ?? null;
+    if (payload.ociSkuName !== undefined) update.ociSkuName = payload.ociSkuName ?? null;
+    if (Object.keys(update).length === 0) {
+      const doc = await this.lineItemModel
+        .findOne({ _id: lineItemId, uploadId })
+        .lean()
+        .exec();
+      if (!doc) return null;
+      const d = doc as typeof doc & { _id: unknown; ociSkuPartNumber?: string | null; ociSkuName?: string | null };
+      return this.toNormalizedLineItem(d);
+    }
+    const doc = await this.lineItemModel
+      .findOneAndUpdate(
+        { _id: lineItemId, uploadId },
+        { $set: update },
+        { new: true },
+      )
+      .lean()
+      .exec();
+    if (!doc) return null;
+    return this.toNormalizedLineItem(doc as typeof doc & { _id: unknown; ociSkuPartNumber?: string | null; ociSkuName?: string | null });
+  }
+
+  private toNormalizedLineItem(
+    d: {
+      _id: unknown;
+      invoiceId?: string | null;
+      linkedAccountId?: string | null;
+      resourceId?: string | null;
+      productId?: number | null;
+      productCode?: string | null;
+      productName?: string | null;
+      serviceCategory?: string | null;
+      usageStartDate?: Date | null;
+      usageEndDate?: Date | null;
+      usageQuantity?: number | null;
+      unitOfMeasure?: string | null;
+      costBeforeTax?: number | null;
+      taxAmount?: number | null;
+      currencyCode?: string;
+      regionId?: number | null;
+      regionName?: string | null;
+      isSpotInstance?: boolean;
+      ociSkuPartNumber?: string | null;
+      ociSkuName?: string | null;
+      rawLine?: Record<string, unknown> | null;
+    },
+  ): NormalizedLineItem {
+    return {
+      id: String(d._id),
+      invoiceId: d.invoiceId ?? null,
+      linkedAccountId: d.linkedAccountId ?? null,
+      resourceId: d.resourceId ?? null,
+      productId: d.productId ?? null,
+      productCode: d.productCode ?? null,
+      productName: d.productName ?? null,
+      serviceCategory: d.serviceCategory ?? null,
+      usageStartDate: d.usageStartDate ?? null,
+      usageEndDate: d.usageEndDate ?? null,
+      usageQuantity: d.usageQuantity ?? null,
+      unitOfMeasure: d.unitOfMeasure ?? null,
+      costBeforeTax: d.costBeforeTax ?? null,
+      taxAmount: d.taxAmount ?? null,
+      currencyCode: d.currencyCode ?? 'USD',
+      regionId: d.regionId ?? null,
+      regionName: d.regionName ?? null,
+      isSpotInstance: d.isSpotInstance ?? false,
+      ociSkuPartNumber: d.ociSkuPartNumber ?? undefined,
+      ociSkuName: d.ociSkuName ?? undefined,
+      rawLine: d.rawLine ?? null,
+    };
+  }
 
   async deleteUpload(uploadId: string): Promise<{ deleted: boolean; uploadId: string }> {
     const upload = await this.uploadModel.findById(uploadId).lean().exec();

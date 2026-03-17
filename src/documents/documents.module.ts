@@ -17,9 +17,12 @@ import { ParserFactory } from './parser-factory.service';
 import { TextractService } from './textract.service';
 import { GeminiService } from './gemini.service';
 import { CollectorService } from './collector.service';
+import { OciSkuMappingsModule } from '../oci-sku-mappings/oci-sku-mappings.module';
+import { OciSkuResolutionService } from './oci-sku-resolution.service';
 
 @Module({
   imports: [
+    OciSkuMappingsModule,
     MongooseModule.forFeature([
       { name: DocumentUpload.name, schema: DocumentUploadSchema },
       { name: DocumentLineItem.name, schema: DocumentLineItemSchema },
@@ -48,6 +51,7 @@ import { CollectorService } from './collector.service';
     // Supporting services
     ProviderDetectionService,
     CostSummaryService,
+    OciSkuResolutionService,
   ],
   exports: [DocumentIngestionService],
 })

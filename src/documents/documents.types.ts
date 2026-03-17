@@ -1,6 +1,8 @@
 export type CloudProviderDetected = 'aws' | 'azure' | 'gcp' | 'oci' | 'unknown';
 
 export interface NormalizedLineItem {
+  /** Mongo _id of document_line_items document; used for PATCH by frontend */
+  id?: string | null;
   invoiceId?: string | null;
   linkedAccountId?: string | null;
   resourceId?: string | null;
@@ -19,6 +21,9 @@ export interface NormalizedLineItem {
   regionId?: number | null;
   regionName?: string | null;
   isSpotInstance?: boolean;
+  /** Resolved or user-edited OCI SKU for lift-and-shift modeling */
+  ociSkuPartNumber?: string | null;
+  ociSkuName?: string | null;
   rawLine?: Record<string, unknown> | null;
 }
 

@@ -60,6 +60,14 @@ export class DocumentLineItem extends Document {
   @Prop({ default: false })
   isSpotInstance: boolean;
 
+  /** Resolved or user-edited OCI SKU part number for lift-and-shift modeling */
+  @Prop({ default: null })
+  ociSkuPartNumber: string | null;
+
+  /** Resolved or user-edited OCI SKU name */
+  @Prop({ default: null })
+  ociSkuName: string | null;
+
   @Prop({ type: MongoSchema.Types.Mixed, default: null })
   rawLine: Record<string, unknown> | null;
 }

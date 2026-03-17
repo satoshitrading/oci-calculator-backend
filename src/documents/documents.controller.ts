@@ -6,6 +6,7 @@ import {
   Get,
   NotFoundException,
   Param,
+  Patch,
   Post,
   Query,
   UploadedFile,
@@ -165,6 +166,27 @@ export class DocumentsController {
       throw new NotFoundException(`Document upload "${uploadId}" not found`);
     }
     return result;
+  }
+
+  /**
+   * PATCH /api/documents/:uploadId/line-items/:lineItemId
+   *
+   * Updates a line item's OCI SKU (for editable Extracted Data table).
+   * Body: { ociSkuPartNumber?: string | null, ociSkuName?: string | null }
+   */
+  @Patch('documents/:uploadId/line-items/:lineItemId')
+  async patchLineItem(
+    @Param('uploadId') uploadId: string,
+    @Param('lineItemId') lineItemId: string,
+    @Body() body: { ociSkuPartNumber?: string | null; ociSkuName?: string | null },
+  ) {
+    const updated = await this.ingestionService.updateLineItemOciSku(uploadId, lineItemId, body ?? {});
+    if (!updated) {
+      throw new NotFoundException(
+        `Line item "${lineItemId}" not found for upload "${uploadId}"`,
+      );
+    }
+    return updated;
   }
 
   /**

@@ -10,9 +10,13 @@ import {
 import { OciCostModelingRepository } from './oci-cost-modeling.repository';
 import { OciCostModelingService } from './oci-cost-modeling.service';
 
+import { NormalizedLineItem } from '../documents/documents.types';
+
 interface ModelRequestBody {
   uploadId?: string;
   currencyCode?: string;
+  /** When provided, use these line items (e.g. from Extracted Data table) instead of unified_billing; OCI SKU from each item is used. */
+  lineItems?: NormalizedLineItem[];
 }
 
 @Controller('api')
@@ -67,10 +71,10 @@ export class OciCostModelingController {
    */
   @Post('oci-cost-modeling/model')
   async runModel(@Body() body: ModelRequestBody) {
-    const { uploadId, currencyCode } = body ?? {};
+    const { uploadId, currencyCode, lineItems } = body ?? {};
     if (!uploadId?.trim()) {
       throw new NotFoundException('uploadId is required in the request body');
     }
-    return this.modelingService.model(uploadId.trim(), currencyCode ?? 'USD');
+    return this.modelingService.model(uploadId.trim(), currencyCode ?? 'USD', lineItems);
   }
 }

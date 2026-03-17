@@ -7,8 +7,10 @@ import { PricingService } from '../calculate/pricing.service';
 import { OciServiceCategory } from '../documents/ingestion.types';
 import { OciSkuCatalogService } from './oci-sku-catalog.service';
 import { OciSkuMappingsRepository } from '../oci-sku-mappings/oci-sku-mappings.repository';
+import { OciSkuMappingRow } from '../oci-sku-mappings/oci-sku-mappings.repository';
 import { similarityToCandidate, SIMILARITY_THRESHOLD } from '../common/similarity.util';
 import { withMongoRetry, BULK_INSERT_BATCH_SIZE } from '../common/mongo-bulk.util';
+import { NormalizedLineItem } from '../documents/documents.types';
 
 // Fix 2: Windows Server license SKU — charged per OCPU per Hour
 // Per requirements: "4 OCPU × 744 hours × $0.092 per OCPU/hour"
@@ -100,13 +102,178 @@ export class OciCostModelingService {
   async model(
     uploadId: string,
     currencyCode: string = 'USD',
+    lineItems?: NormalizedLineItem[],
   ): Promise<LiftAndShiftResult> {
     this.logger.log(`[${uploadId}] Starting OCI lift-and-shift modeling`);
 
-    const billingRecords = await this.unifiedBillingModel
-      .find({ uploadId })
-      .lean()
-      .exec();
+    type VirtualRecord = {
+      productName: string | null;
+      productCode: string | null;
+      serviceCategory: OciServiceCategory;
+      costBeforeTax: number | null;
+      costAfterTax: number | null;
+      usageQuantity: number | null;
+      ociEquivalentQuantity: number | null;
+      provider: string;
+      currencyCode: string;
+      isWindowsLicensed: boolean;
+      sourceResourceId: string | null;
+    };
+    type MappingRow = { record: VirtualRecord; mapping: OciSkuMappingRow | null };
+
+    let billingRecords: VirtualRecord[];
+    let resolved: MappingRow[];
+    let providerDetected: string;
+
+    if (lineItems != null && lineItems.length > 0) {
+      // Use line items from Extracted Data table (with optional pre-set OCI SKU)
+      const standardCategories = [
+        OciServiceCategory.COMPUTE,
+        OciServiceCategory.STORAGE,
+        OciServiceCategory.NETWORK,
+        OciServiceCategory.DATABASE,
+        OciServiceCategory.OTHER,
+      ];
+      const categoriesFromItems = lineItems.map((i) => String(i.serviceCategory ?? OciServiceCategory.OTHER));
+      const categories = [...new Set([...standardCategories, ...categoriesFromItems])];
+      const candidatesByCategory: Record<string, OciSkuMappingRow[]> = {};
+      for (const cat of categories) {
+        candidatesByCategory[cat] = await this.ociSkuMappings.listByCategory(cat);
+      }
+
+      billingRecords = lineItems.map((item) => {
+        const category = (item.serviceCategory as OciServiceCategory) ?? OciServiceCategory.OTHER;
+        const usageQuantity = item.usageQuantity != null ? Number(item.usageQuantity) : null;
+        const ociEquivalentQuantity =
+          category === OciServiceCategory.COMPUTE && usageQuantity != null
+            ? usageQuantity / 2
+            : usageQuantity;
+        const costBeforeTax = item.costBeforeTax != null ? Number(item.costBeforeTax) : 0;
+        return {
+          productName: item.productName ?? null,
+          productCode: item.productCode ?? null,
+          serviceCategory: category,
+          costBeforeTax,
+          costAfterTax: costBeforeTax,
+          usageQuantity,
+          ociEquivalentQuantity,
+          provider: 'unknown',
+          currencyCode: item.currencyCode ?? 'USD',
+          isWindowsLicensed: false,
+          sourceResourceId: null,
+        };
+      });
+
+      resolved = billingRecords.map((record, idx) => {
+        const item = lineItems[idx]!;
+        const partNumber = item.ociSkuPartNumber != null && String(item.ociSkuPartNumber).trim() !== ''
+          ? String(item.ociSkuPartNumber).trim()
+          : null;
+        const ociSkuName = item.ociSkuName != null && String(item.ociSkuName).trim() !== ''
+          ? String(item.ociSkuName).trim()
+          : null;
+        if (partNumber) {
+          const mapping: OciSkuMappingRow = {
+            id: '',
+            partNumber,
+            productTitle: ociSkuName ?? partNumber,
+            productTitleNormalized: (ociSkuName ?? partNumber).toLowerCase(),
+            skuName: ociSkuName ?? null,
+            serviceCategory: record.serviceCategory,
+            unit: 'OCPU-hours',
+            fallbackUnitPrice: null,
+          };
+          return { record, mapping };
+        }
+        const category = record.serviceCategory;
+        const sourceService = record.productName || record.productCode || String(category);
+        const candidates = candidatesByCategory[String(category)] ?? [];
+        if (candidates.length === 0) return { record, mapping: null };
+        let best = candidates[0]!;
+        let bestScore = similarityToCandidate(sourceService, best.skuName ?? best.productTitle, '');
+        for (let i = 1; i < candidates.length; i++) {
+          const m = candidates[i]!;
+          const score = similarityToCandidate(sourceService, m.skuName ?? m.productTitle, '');
+          if (score > bestScore) {
+            bestScore = score;
+            best = m;
+          }
+        }
+        if (bestScore < SIMILARITY_THRESHOLD) return { record, mapping: null };
+        return { record, mapping: best };
+      });
+
+      providerDetected = 'unknown';
+    } else {
+      const dbRecords = await this.unifiedBillingModel
+        .find({ uploadId })
+        .lean()
+        .exec();
+
+      if (!dbRecords.length) {
+        return this.emptyResult(uploadId, currencyCode);
+      }
+
+      billingRecords = dbRecords.map((r) => ({
+        productName: r.productName ?? null,
+        productCode: r.productCode ?? null,
+        serviceCategory: (r.serviceCategory as OciServiceCategory) ?? OciServiceCategory.OTHER,
+        costBeforeTax: r.costBeforeTax ?? null,
+        costAfterTax: r.costAfterTax ?? r.costBeforeTax ?? null,
+        usageQuantity: r.usageQuantity ?? null,
+        ociEquivalentQuantity: r.ociEquivalentQuantity ?? null,
+        provider: r.provider ?? 'unknown',
+        currencyCode: r.currencyCode ?? 'USD',
+        isWindowsLicensed: r.isWindowsLicensed ?? false,
+        sourceResourceId: r.sourceResourceId ?? null,
+      })) as VirtualRecord[];
+
+      providerDetected =
+        dbRecords.find((r) => r.provider && r.provider !== 'unknown')?.provider ??
+        dbRecords[0]?.provider ??
+        'unknown';
+
+      const standardCategories = [
+        OciServiceCategory.COMPUTE,
+        OciServiceCategory.STORAGE,
+        OciServiceCategory.NETWORK,
+        OciServiceCategory.DATABASE,
+        OciServiceCategory.OTHER,
+      ];
+      const categoriesFromBilling = billingRecords.map((r) => String(r.serviceCategory ?? OciServiceCategory.OTHER));
+      const categories = [...new Set([...standardCategories, ...categoriesFromBilling])];
+      const candidatesByCategory: Record<string, OciSkuMappingRow[]> = {};
+      for (const cat of categories) {
+        candidatesByCategory[cat] = await this.ociSkuMappings.listByCategory(cat);
+      }
+      const resolvedDb: MappingRow[] = billingRecords.map((record) => {
+        const category = (record.serviceCategory as OciServiceCategory) ?? OciServiceCategory.OTHER;
+        const sourceService = record.productName || record.productCode || String(category);
+        const candidates = candidatesByCategory[String(category)] ?? [];
+        if (candidates.length === 0) return { record, mapping: null };
+        let best = candidates[0]!;
+        let bestScore = similarityToCandidate(
+          sourceService,
+          best.skuName ?? best.productTitle,
+          '',
+        );
+        for (let i = 1; i < candidates.length; i++) {
+          const m = candidates[i]!;
+          const score = similarityToCandidate(
+            sourceService,
+            m.skuName ?? m.productTitle,
+            '',
+          );
+          if (score > bestScore) {
+            bestScore = score;
+            best = m;
+          }
+        }
+        if (bestScore < SIMILARITY_THRESHOLD) return { record, mapping: null };
+        return { record, mapping: best };
+      });
+      resolved = resolvedDb;
+    }
 
     if (!billingRecords.length) {
       return this.emptyResult(uploadId, currencyCode);
@@ -114,59 +281,6 @@ export class OciCostModelingService {
 
     // Delete any prior modeling records for this upload (idempotent re-run)
     await withMongoRetry(() => this.modelingModel.deleteMany({ uploadId }).exec());
-
-    const providerDetected =
-      billingRecords.find((r) => r.provider && r.provider !== 'unknown')?.provider ??
-      billingRecords[0]?.provider ??
-      'unknown';
-
-    // ── Step 1: Obtain category from each record; filter OCI SKU list by category; pick best by similarity ─
-    const standardCategories = [
-      OciServiceCategory.COMPUTE,
-      OciServiceCategory.STORAGE,
-      OciServiceCategory.NETWORK,
-      OciServiceCategory.DATABASE,
-      OciServiceCategory.OTHER,
-    ];
-    const categoriesFromBilling = billingRecords.map((r) => String(r.serviceCategory ?? OciServiceCategory.OTHER));
-    const categories = [...new Set([...standardCategories, ...categoriesFromBilling])];
-    const candidatesByCategory: Record<string, Awaited<ReturnType<OciSkuMappingsRepository['listByCategory']>>> = {};
-    for (const cat of categories) {
-      candidatesByCategory[cat] = await this.ociSkuMappings.listByCategory(cat);
-    }
-    console.log(candidatesByCategory, '===candidatesByCategory')
-    type MappingRow = { record: (typeof billingRecords)[0]; mapping: Awaited<ReturnType<OciSkuMappingsRepository['listByCategory']>>[number] | null };
-    const resolved: MappingRow[] = billingRecords.map((record) => {
-      const category = (record.serviceCategory as OciServiceCategory) ?? OciServiceCategory.OTHER;
-      const sourceService =
-        record.productName || record.productCode || String(category);
-      const candidates = candidatesByCategory[String(category)] ?? [];
-      if (candidates.length === 0) {
-        return { record, mapping: null };
-      }
-      let best = candidates[0]!;
-      let bestScore = similarityToCandidate(
-        sourceService,
-        best.skuName ?? best.productTitle,
-        '',
-      );
-      for (let i = 1; i < candidates.length; i++) {
-        const m = candidates[i]!;
-        const score = similarityToCandidate(
-          sourceService,
-          m.skuName ?? m.productTitle,
-          '',
-        );
-        if (score > bestScore) {
-          bestScore = score;
-          best = m;
-        }
-      }
-      if (bestScore < SIMILARITY_THRESHOLD) {
-        return { record, mapping: null };
-      }
-      return { record, mapping: best };
-    });
 
     // Collect unique part numbers only from matched rows + Windows license SKU
     const partNumbersNeeded = new Set<string>(
