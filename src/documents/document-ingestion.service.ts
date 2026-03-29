@@ -1,8 +1,14 @@
-import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger, NotFoundException, Optional } from '@nestjs/common';
+import { InjectQueue } from '@nestjs/bullmq';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
-import { mkdir, writeFile } from 'fs/promises';
+import { Queue } from 'bullmq';
+import { mkdir, readFile, writeFile } from 'fs/promises';
 import { join } from 'path';
+import { tmpdir } from 'os';
+import { DOCUMENT_INGESTION_QUEUE } from './ingestion-queue.constants';
+import type { CollectIngestionJobData, UploadIngestionJobData } from './ingestion-job.types';
+import { withMongoRetry, BULK_INSERT_BATCH_SIZE } from '../common/mongo-bulk.util';
 import { DocumentUpload, DocumentUploadStatus } from '../database/schemas/document-upload.schema';
 import { DocumentLineItem } from '../database/schemas/document-line-item.schema';
 import { UnifiedBilling } from '../database/schemas/unified-billing.schema';
@@ -38,6 +44,17 @@ const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50 MB
  * Such items are excluded from MongoDB, Grand total, and the Extracted Data table.
  * If an item has at least one of (quantity, unitOfMeasure, regionName), it is a real line item.
  */
+/** Row shape after NormalizationService (extra fields not listed on NormalizedLineItem). */
+type PersistableLineItem = NormalizedLineItem & {
+  ociEquivalentQuantity?: number | null;
+  isPaidSku?: boolean;
+  brlTaxAmount?: number | null;
+  costAfterTax?: number | null;
+  isGenerativeAI?: boolean;
+  isWindowsLicensed?: boolean;
+  windowsSkuCode?: string | null;
+};
+
 function isTaxOnlyLineItem(item: NormalizedLineItem): boolean {
   const hasQuantity = item.usageQuantity != null && (typeof item.usageQuantity !== 'number' || !Number.isNaN(item.usageQuantity));
   const hasUnit = item.unitOfMeasure != null && String(item.unitOfMeasure).trim() !== '';
@@ -50,10 +67,11 @@ function isTaxOnlyLineItem(item: NormalizedLineItem): boolean {
  * The controller calls only this service; all other services are internal details.
  *
  * Pipeline:
- *   File → ParserFactory (type detection + extraction)
- *        → NormalizationService (OCI category mapping, OCPU conversion, Windows flag)
- *        → MongoDB: DocumentUpload (status tracking) + UnifiedBilling (primary store)
- *                                                    + DocumentLineItem (backward compat.)
+ *   File → persisted to disk → (optional Redis queue) → ParserFactory → NormalizationService
+ *        → MongoDB (batched inserts): DocumentUpload + UnifiedBilling + DocumentLineItem
+ *
+ * When REDIS_URL is set, BullMQ runs ingestion with retries (concurrency 1). Otherwise the same
+ * pipeline runs in-process after the HTTP response, as before.
  */
 @Injectable()
 export class DocumentIngestionService {
@@ -73,6 +91,7 @@ export class DocumentIngestionService {
     private readonly costSummaryService: CostSummaryService,
     private readonly collectorService: CollectorService,
     private readonly ociSkuResolutionService: OciSkuResolutionService,
+    @Optional() @InjectQueue(DOCUMENT_INGESTION_QUEUE) private readonly ingestionQueue?: Queue,
   ) {}
 
   // ---------------------------------------------------------------------------
@@ -114,12 +133,46 @@ export class DocumentIngestionService {
     const uploadId = String(uploadDoc._id);
     this.logger.log(`[${uploadId}] Ingestion started for "${file.originalname}"`);
 
-    // 2. Run pipeline in background (includes optional file persist); return immediately to avoid 504 timeout
     const originalName = file.originalname ?? 'unknown';
     const mimeType = file.mimetype ?? 'application/octet-stream';
-    void this.runPipeline(uploadId, buffer, originalName, mimeType, dto, extractor).catch((err) => {
-      this.logger.error(`[${uploadId}] Background pipeline error: ${err instanceof Error ? err.message : String(err)}`);
-    });
+
+    const { absolutePath, storagePath } = await this.persistUploadBuffer(buffer, uploadId, originalName);
+    await this.uploadModel.updateOne({ _id: uploadId }, { storagePath });
+
+    const jobPayload: UploadIngestionJobData = {
+      uploadId,
+      absolutePath,
+      originalName,
+      mimeType,
+      dto: { providerHint: dto.providerHint, label: dto.label },
+      extractor,
+    };
+
+    if (this.ingestionQueue) {
+      try {
+        await this.ingestionQueue.add('upload', jobPayload, {
+          jobId: `upload-${uploadId}`,
+          attempts: 3,
+          backoff: { type: 'exponential', delay: 10_000 },
+        });
+        this.logger.log(`[${uploadId}] Ingestion job queued (Redis)`);
+      } catch (err) {
+        this.logger.error(
+          `[${uploadId}] Failed to enqueue upload job: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        await this.uploadModel.updateOne(
+          { _id: uploadId },
+          {
+            status: 'failed' as DocumentUploadStatus,
+            errorMessage: 'Failed to queue ingestion job. Check Redis connectivity.',
+          },
+        );
+      }
+    } else {
+      void this.runIngestionCore(uploadId, buffer, originalName, mimeType, dto, extractor).catch((err) => {
+        this.logger.error(`[${uploadId}] Background pipeline error: ${err instanceof Error ? err.message : String(err)}`);
+      });
+    }
 
     return {
       uploadId,
@@ -132,10 +185,32 @@ export class DocumentIngestionService {
   }
 
   /**
-   * Background pipeline: parse with progress callback, then normalize and persist.
-   * Updates DocumentUpload progressPercent/processedPages/totalPages during parse, then status completed/failed.
+   * Called by BullMQ worker: read file from disk and run parse → normalize → persist.
    */
-  private async runPipeline(
+  async processQueuedUpload(data: UploadIngestionJobData): Promise<void> {
+    const buffer = await readFile(data.absolutePath);
+    const dto: UploadDocumentDto = {
+      providerHint: data.dto.providerHint as UploadDocumentDto['providerHint'],
+      label: data.dto.label,
+    };
+    await this.runIngestionCore(data.uploadId, buffer, data.originalName, data.mimeType, dto, data.extractor);
+  }
+
+  /** Worker entry for automated collect jobs. */
+  async processQueuedCollect(data: CollectIngestionJobData): Promise<void> {
+    const dto: CollectBillingDto = {
+      backend: data.dto.backend as CollectBillingDto['backend'],
+      providerHint: data.dto.providerHint as CollectBillingDto['providerHint'],
+      prefix: data.dto.prefix,
+      dryRun: data.dto.dryRun,
+    };
+    await this.runCollectPipeline(data.uploadId, dto);
+  }
+
+  /**
+   * Parse with progress callback, normalize, batched DB writes, then completed/failed status.
+   */
+  private async runIngestionCore(
     uploadId: string,
     buffer: Buffer,
     originalName: string,
@@ -147,13 +222,7 @@ export class DocumentIngestionService {
       this.updateProgress(uploadId, processed, total);
 
     try {
-      // Optional: persist file to disk in background (not in request path to avoid 504)
-      const storagePath = await this.persistFile(buffer, uploadId, originalName);
-      if (storagePath) {
-        await this.uploadModel.updateOne({ _id: uploadId }, { storagePath });
-      }
-
-      const { lineItems: rawItems, providerDetected, fileType, totalTax, invoiceBillingPeriod } =
+      const { lineItems: rawItems, providerDetected, totalTax, invoiceBillingPeriod } =
         await this.parserFactory.parseFromBuffer(
           buffer,
           originalName,
@@ -163,71 +232,21 @@ export class DocumentIngestionService {
           { onProgress },
         );
 
-      // Exclude tax-only rows (no Quantity, Unit, or Region): do not insert to DB or include in Grand total
       const lineItemsForIngestion = rawItems.filter((item) => !isTaxOnlyLineItem(item));
-
       const normalizedItems = this.normalizationService.normalizeAll(lineItemsForIngestion, providerDetected);
       const costSummary = this.costSummaryService.build(normalizedItems, totalTax ?? null);
 
-      if (normalizedItems.length > 0) {
-        await this.unifiedBillingModel.insertMany(
-          normalizedItems.map((item) => ({
-            uploadId,
-            provider: providerDetected,
-            sourceResourceId: item.resourceId ?? null,
-            invoiceId: item.invoiceId ?? null,
-            productCode: item.productCode ?? null,
-            productName: item.productName ?? null,
-            usageQuantity: item.usageQuantity ?? null,
-            ociEquivalentQuantity: item.ociEquivalentQuantity ?? null,
-            serviceCategory: item.serviceCategory,
-            unitPrice: item.unitPrice ?? null,
-            isPaidSku: item.isPaidSku ?? true,
-            brlTaxAmount: item.brlTaxAmount ?? null,
-            costAfterTax: item.costAfterTax ?? item.costBeforeTax ?? null,
-            isGenerativeAI: item.isGenerativeAI ?? false,
-            isWindowsLicensed: item.isWindowsLicensed ?? false,
-            windowsSkuCode: item.windowsSkuCode ?? null,
-            costBeforeTax: item.costBeforeTax ?? null,
-            currencyCode: item.currencyCode ?? 'USD',
-            regionName: item.regionName ?? null,
-            usageStartDate: item.usageStartDate ?? null,
-            usageEndDate: item.usageEndDate ?? null,
-            ingestionStatus: IngestionStatus.COMPLETED,
-            rawData: item.rawLine ?? null,
-          })),
-        );
-        await this.lineItemModel.insertMany(
-          normalizedItems.map((item) => ({
-            uploadId,
-            providerId: null,
-            invoiceId: item.invoiceId ?? null,
-            linkedAccountId: item.linkedAccountId ?? null,
-            resourceId: item.resourceId ?? null,
-            productId: item.productId ?? null,
-            productCode: item.productCode ?? null,
-            productName: item.productName ?? null,
-            serviceCategory: item.serviceCategory ?? null,
-            usageStartDate: item.usageStartDate ?? null,
-            usageEndDate: item.usageEndDate ?? null,
-            usageQuantity: item.usageQuantity ?? null,
-            unitOfMeasure: item.unitOfMeasure ?? null,
-            costBeforeTax: item.costBeforeTax ?? null,
-            taxAmount: item.taxAmount ?? null,
-            currencyCode: item.currencyCode ?? 'USD',
-            regionId: item.regionId ?? null,
-            regionName: item.regionName ?? null,
-            isSpotInstance: item.isSpotInstance ?? false,
-            rawLine: item.rawLine ?? null,
-          })),
-        );
-      }
+      await this.persistNormalizedLineItems(
+        uploadId,
+        providerDetected as CloudProviderDetected,
+        normalizedItems as PersistableLineItem[],
+      );
 
       await this.uploadModel.updateOne(
         { _id: uploadId },
         {
           status: 'completed' as DocumentUploadStatus,
-          providerDetected,
+          providerDetected: providerDetected as CloudProviderDetected,
           progressPercent: 100,
           processedPages: null,
           totalPages: null,
@@ -257,6 +276,89 @@ export class DocumentIngestionService {
       { _id: uploadId },
       { progressPercent, processedPages, totalPages },
     );
+  }
+
+  /** Always persist upload buffer so the worker can read from disk (avoids huge Redis payloads). */
+  private async persistUploadBuffer(
+    buffer: Buffer,
+    uploadId: string,
+    originalName: string,
+  ): Promise<{ absolutePath: string; storagePath: string }> {
+    const basePath = process.env.UPLOAD_STORAGE_PATH?.trim();
+    const dir = basePath ? basePath : join(tmpdir(), 'oci-price-calculator-ingestion');
+    await mkdir(dir, { recursive: true });
+    const ext = originalName.match(/\.(pdf|csv|xlsx)$/i)?.[0]?.toLowerCase() ?? '';
+    const fileName = `${uploadId}${ext}`;
+    const absolutePath = join(dir, fileName);
+    await writeFile(absolutePath, buffer);
+    const storagePath = basePath ? fileName : absolutePath;
+    return { absolutePath, storagePath };
+  }
+
+  private async persistNormalizedLineItems(
+    uploadId: string,
+    providerDetected: CloudProviderDetected,
+    normalizedItems: PersistableLineItem[],
+  ): Promise<void> {
+    if (normalizedItems.length === 0) return;
+
+    const unifiedDocs = normalizedItems.map((item) => ({
+      uploadId,
+      provider: providerDetected,
+      sourceResourceId: item.resourceId ?? null,
+      invoiceId: item.invoiceId ?? null,
+      productCode: item.productCode ?? null,
+      productName: item.productName ?? null,
+      usageQuantity: item.usageQuantity ?? null,
+      ociEquivalentQuantity: item.ociEquivalentQuantity ?? null,
+      serviceCategory: item.serviceCategory,
+      unitPrice: item.unitPrice ?? null,
+      isPaidSku: item.isPaidSku ?? true,
+      brlTaxAmount: item.brlTaxAmount ?? null,
+      costAfterTax: item.costAfterTax ?? item.costBeforeTax ?? null,
+      isGenerativeAI: item.isGenerativeAI ?? false,
+      isWindowsLicensed: item.isWindowsLicensed ?? false,
+      windowsSkuCode: item.windowsSkuCode ?? null,
+      costBeforeTax: item.costBeforeTax ?? null,
+      currencyCode: item.currencyCode ?? 'USD',
+      regionName: item.regionName ?? null,
+      usageStartDate: item.usageStartDate ?? null,
+      usageEndDate: item.usageEndDate ?? null,
+      ingestionStatus: IngestionStatus.COMPLETED,
+      rawData: item.rawLine ?? null,
+    }));
+
+    const lineDocs = normalizedItems.map((item) => ({
+      uploadId,
+      providerId: null,
+      invoiceId: item.invoiceId ?? null,
+      linkedAccountId: item.linkedAccountId ?? null,
+      resourceId: item.resourceId ?? null,
+      productId: item.productId ?? null,
+      productCode: item.productCode ?? null,
+      productName: item.productName ?? null,
+      serviceCategory: item.serviceCategory ?? null,
+      usageStartDate: item.usageStartDate ?? null,
+      usageEndDate: item.usageEndDate ?? null,
+      usageQuantity: item.usageQuantity ?? null,
+      unitOfMeasure: item.unitOfMeasure ?? null,
+      costBeforeTax: item.costBeforeTax ?? null,
+      taxAmount: item.taxAmount ?? null,
+      currencyCode: item.currencyCode ?? 'USD',
+      regionId: item.regionId ?? null,
+      regionName: item.regionName ?? null,
+      isSpotInstance: item.isSpotInstance ?? false,
+      rawLine: item.rawLine ?? null,
+    }));
+
+    for (let i = 0; i < unifiedDocs.length; i += BULK_INSERT_BATCH_SIZE) {
+      const batch = unifiedDocs.slice(i, i + BULK_INSERT_BATCH_SIZE);
+      await withMongoRetry(() => this.unifiedBillingModel.insertMany(batch, { ordered: false }));
+    }
+    for (let i = 0; i < lineDocs.length; i += BULK_INSERT_BATCH_SIZE) {
+      const batch = lineDocs.slice(i, i + BULK_INSERT_BATCH_SIZE);
+      await withMongoRetry(() => this.lineItemModel.insertMany(batch, { ordered: false }));
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -296,11 +398,43 @@ export class DocumentIngestionService {
     const uploadId = String(uploadDoc._id);
     this.logger.log(`[${uploadId}] Collect started; running in background`);
 
-    void this.runCollectPipeline(uploadId, dto).catch((err) => {
-      this.logger.error(
-        `[${uploadId}] Collect pipeline error: ${err instanceof Error ? err.message : String(err)}`,
-      );
-    });
+    const collectPayload: CollectIngestionJobData = {
+      uploadId,
+      dto: {
+        backend: dto.backend,
+        providerHint: dto.providerHint,
+        prefix: dto.prefix,
+        dryRun: dto.dryRun,
+      },
+    };
+
+    if (this.ingestionQueue) {
+      try {
+        await this.ingestionQueue.add('collect', collectPayload, {
+          jobId: `collect-${uploadId}`,
+          attempts: 3,
+          backoff: { type: 'exponential', delay: 10_000 },
+        });
+        this.logger.log(`[${uploadId}] Collect job queued (Redis)`);
+      } catch (err) {
+        this.logger.error(
+          `[${uploadId}] Failed to enqueue collect job: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        await this.uploadModel.updateOne(
+          { _id: uploadId },
+          {
+            status: 'failed' as DocumentUploadStatus,
+            errorMessage: 'Failed to queue ingestion job. Check Redis connectivity.',
+          },
+        );
+      }
+    } else {
+      void this.runCollectPipeline(uploadId, dto).catch((err) => {
+        this.logger.error(
+          `[${uploadId}] Collect pipeline error: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+    }
 
     return {
       uploadId,
@@ -357,60 +491,11 @@ export class DocumentIngestionService {
       );
       const costSummary = this.costSummaryService.build(normalizedItems);
 
-      if (normalizedItems.length > 0) {
-        await this.unifiedBillingModel.insertMany(
-          normalizedItems.map((item) => ({
-            uploadId,
-            provider: providerDetected,
-            sourceResourceId: item.resourceId ?? null,
-            invoiceId: item.invoiceId ?? null,
-            productCode: item.productCode ?? null,
-            productName: item.productName ?? null,
-            usageQuantity: item.usageQuantity ?? null,
-            ociEquivalentQuantity: item.ociEquivalentQuantity ?? null,
-            serviceCategory: item.serviceCategory,
-            unitPrice: item.unitPrice ?? null,
-            isPaidSku: item.isPaidSku ?? true,
-            brlTaxAmount: item.brlTaxAmount ?? null,
-            costAfterTax: item.costAfterTax ?? item.costBeforeTax ?? null,
-            isGenerativeAI: item.isGenerativeAI ?? false,
-            isWindowsLicensed: item.isWindowsLicensed ?? false,
-            windowsSkuCode: item.windowsSkuCode ?? null,
-            costBeforeTax: item.costBeforeTax ?? null,
-            currencyCode: item.currencyCode ?? 'USD',
-            regionName: item.regionName ?? null,
-            usageStartDate: item.usageStartDate ?? null,
-            usageEndDate: item.usageEndDate ?? null,
-            ingestionStatus: IngestionStatus.COMPLETED,
-            rawData: item.rawLine ?? null,
-          })),
-        );
-
-        await this.lineItemModel.insertMany(
-          normalizedItems.map((item) => ({
-            uploadId,
-            providerId: null,
-            invoiceId: item.invoiceId ?? null,
-            linkedAccountId: item.linkedAccountId ?? null,
-            resourceId: item.resourceId ?? null,
-            productId: item.productId ?? null,
-            productCode: item.productCode ?? null,
-            productName: item.productName ?? null,
-            serviceCategory: item.serviceCategory ?? null,
-            usageStartDate: item.usageStartDate ?? null,
-            usageEndDate: item.usageEndDate ?? null,
-            usageQuantity: item.usageQuantity ?? null,
-            unitOfMeasure: item.unitOfMeasure ?? null,
-            costBeforeTax: item.costBeforeTax ?? null,
-            taxAmount: item.taxAmount ?? null,
-            currencyCode: item.currencyCode ?? 'USD',
-            regionId: item.regionId ?? null,
-            regionName: item.regionName ?? null,
-            isSpotInstance: item.isSpotInstance ?? false,
-            rawLine: item.rawLine ?? null,
-          })),
-        );
-      }
+      await this.persistNormalizedLineItems(
+        uploadId,
+        providerDetected as CloudProviderDetected,
+        normalizedItems as PersistableLineItem[],
+      );
 
       await this.uploadModel.updateOne(
         { _id: uploadId },
@@ -740,24 +825,6 @@ export class DocumentIngestionService {
   // ---------------------------------------------------------------------------
   // Private helpers
   // ---------------------------------------------------------------------------
-
-  private async persistFile(
-    buffer: Buffer,
-    uploadId: string,
-    originalName: string,
-  ): Promise<string | null> {
-    const basePath = process.env.UPLOAD_STORAGE_PATH?.trim();
-    if (!basePath) return null;
-    try {
-      await mkdir(basePath, { recursive: true });
-      const ext = originalName.match(/\.(pdf|csv|xlsx)$/i)?.[0]?.toLowerCase() ?? '';
-      const fileName = `${uploadId}${ext}`;
-      await writeFile(join(basePath, fileName), buffer);
-      return fileName;
-    } catch {
-      return null;
-    }
-  }
 
   private sanitizeErrorMessage(err: unknown): string {
     const raw = err instanceof Error ? err.message : 'Processing failed';

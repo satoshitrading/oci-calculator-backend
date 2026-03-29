@@ -21,7 +21,7 @@ import { DocumentsModule } from './documents/documents.module';
       useFactory: () => ({
         uri: process.env.MONGODB_URI || process.env.DATABASE_URL || 'mongodb://localhost:27017/oci-price-calculator',
         serverSelectionTimeoutMS: 10000,
-        socketTimeoutMS: 45000,
+        socketTimeoutMS: 120_000,
         maxPoolSize: 10,
       }),
     }),

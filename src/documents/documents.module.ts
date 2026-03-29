@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { BullModule } from '@nestjs/bullmq';
 import { MongooseModule } from '@nestjs/mongoose';
 import { DocumentUpload, DocumentUploadSchema } from '../database/schemas/document-upload.schema';
 import { DocumentLineItem, DocumentLineItemSchema } from '../database/schemas/document-line-item.schema';
@@ -19,10 +20,32 @@ import { GeminiService } from './gemini.service';
 import { CollectorService } from './collector.service';
 import { OciSkuMappingsModule } from '../oci-sku-mappings/oci-sku-mappings.module';
 import { OciSkuResolutionService } from './oci-sku-resolution.service';
+import { DOCUMENT_INGESTION_QUEUE } from './ingestion-queue.constants';
+import { DocumentIngestionProcessor } from './document-ingestion.processor';
+
+const ingestionRedisUrl = process.env.REDIS_URL?.trim();
+const ingestionQueueModules =
+  ingestionRedisUrl && ingestionRedisUrl.length > 0
+    ? [
+        BullModule.forRoot({
+          connection: { url: ingestionRedisUrl },
+        }),
+        BullModule.registerQueue({
+          name: DOCUMENT_INGESTION_QUEUE,
+          defaultJobOptions: {
+            attempts: 3,
+            backoff: { type: 'exponential', delay: 10_000 },
+            removeOnComplete: 200,
+            removeOnFail: 100,
+          },
+        }),
+      ]
+    : [];
 
 @Module({
   imports: [
     OciSkuMappingsModule,
+    ...ingestionQueueModules,
     MongooseModule.forFeature([
       { name: DocumentUpload.name, schema: DocumentUploadSchema },
       { name: DocumentLineItem.name, schema: DocumentLineItemSchema },
@@ -34,6 +57,7 @@ import { OciSkuResolutionService } from './oci-sku-resolution.service';
   providers: [
     // Core ingestion orchestrator (only entry point for the controller)
     DocumentIngestionService,
+    ...(ingestionRedisUrl && ingestionRedisUrl.length > 0 ? [DocumentIngestionProcessor] : []),
 
     // Phase 1 – new services
     ParserFactory,
